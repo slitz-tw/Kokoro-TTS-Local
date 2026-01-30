@@ -626,12 +626,12 @@ def main() -> None:
                 ext = os.path.splitext(file_path)[1].lower()
                 try:
                     if ext == ".epub":
-                            text = extract_text_from_epub(file_path, select_chapter=True)
-                        elif ext == ".pdf":
-                            text = extract_text_from_pdf(file_path)
-                        else:
-                            print("Unsupported file type. Please provide an EPUB or PDF file.")
-                            continue
+                        text = extract_text_from_epub(file_path, select_chapter=True)
+                    elif ext == ".pdf":
+                        text = extract_text_from_pdf(file_path)
+                    else:
+                        print("Unsupported file type. Please provide an EPUB or PDF file.")
+                        continue
                 except Exception as e:
                     print(f"Error extracting text: {e}")
                     continue
