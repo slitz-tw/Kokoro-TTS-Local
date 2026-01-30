@@ -347,6 +347,176 @@ def _stop_play_handles(play_handles):
         pass
 
 
+def _control_listener(interrupt_event, pause_event, stop_event):
+    """Cross-platform background listener for streaming controls.
+
+    Keys:
+      - 'i' : interrupt (stop generation and return to choices)
+      - 'p' or space: toggle pause/play
+
+    Uses msvcrt on Windows, otherwise tries to use termios/select on POSIX.
+    Exits when stop_event is set.
+    """
+    try:
+        import msvcrt
+        use_msvcrt = True
+    except Exception:
+        use_msvcrt = False
+
+    if use_msvcrt:
+        print("(Streaming) Press 'i' to interrupt, 'p' to pause/resume.")
+        while not stop_event.is_set() and not interrupt_event.is_set():
+            try:
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch.lower() == 'i':
+                        interrupt_event.set()
+                        print("\nInterrupt requested by user.")
+                        break
+                    if ch.lower() == 'p' or ch == ' ':
+                        if pause_event.is_set():
+                            pause_event.clear()
+                            print("\nResuming playback.")
+                        else:
+                            pause_event.set()
+                            print("\nPlayback paused. Press 'p' to resume.")
+            except Exception:
+                pass
+            time.sleep(0.05)
+        return
+
+    # POSIX fallback
+    try:
+        import sys, select, tty, termios
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        print("(Streaming) Press 'i' to interrupt, 'p' to pause/resume.")
+        while not stop_event.is_set() and not interrupt_event.is_set():
+            dr, dw, de = select.select([sys.stdin], [], [], 0.05)
+            if dr:
+                ch = sys.stdin.read(1)
+                if ch.lower() == 'i':
+                    interrupt_event.set()
+                    print("\nInterrupt requested by user.")
+                    break
+                if ch.lower() == 'p' or ch == ' ':
+                    if pause_event.is_set():
+                        pause_event.clear()
+                        print("\nResuming playback.")
+                    else:
+                        pause_event.set()
+                        print("\nPlayback paused. Press 'p' to resume.")
+    except Exception:
+        # No usable stdin controls — silently return
+        return
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except Exception:
+            pass
+
+
+def _playback_worker(play_queue, pause_event, stop_event, play_handles, stream_delay=None):
+    """Sequential playback worker that respects pause and stop events.
+
+    Playback items are tuples (audio_np, sample_rate). A sentinel (None, None)
+    signals end of stream.
+    """
+    try:
+        while not stop_event.is_set():
+            try:
+                item = play_queue.get(timeout=0.1)
+            except Exception:
+                continue
+            if item is None:
+                break
+            audio_np, sr = item
+            # Wait while paused
+            while pause_event.is_set() and not stop_event.is_set():
+                time.sleep(0.1)
+            if stop_event.is_set():
+                break
+
+            # Play synchronously so we can pause/resume and stop reliably
+            played_handle = None
+            try:
+                import simpleaudio as sa
+                data = (audio_np * 32767).astype(np.int16).tobytes()
+                played_handle = sa.play_buffer(data, 1, 2, sr)
+                play_handles.append(played_handle)
+                # Wait for playback to finish or stop event
+                while not stop_event.is_set() and not (played_handle.is_playing() == False):
+                    if pause_event.is_set():
+                        try:
+                            played_handle.stop()
+                        except Exception:
+                            pass
+                        # Wait until resumed, then re-play from start
+                        while pause_event.is_set() and not stop_event.is_set():
+                            time.sleep(0.1)
+                        if stop_event.is_set():
+                            break
+                        # Re-play segment fully after resume
+                        played_handle = sa.play_buffer(data, 1, 2, sr)
+                        play_handles.append(played_handle)
+                    time.sleep(0.05)
+                # Ensure we wait done if not stopped
+                try:
+                    played_handle.wait_done()
+                except Exception:
+                    pass
+            except Exception:
+                # Fallback to sounddevice
+                try:
+                    import sounddevice as sd
+                    sd.play(audio_np, sr)
+                    # Wait for playback, respecting pause and stop
+                    while sd.get_stream() is not None and not stop_event.is_set():
+                        if pause_event.is_set():
+                            try:
+                                sd.stop()
+                            except Exception:
+                                pass
+                            while pause_event.is_set() and not stop_event.is_set():
+                                time.sleep(0.1)
+                            if stop_event.is_set():
+                                break
+                            sd.play(audio_np, sr)
+                        time.sleep(0.05)
+                    try:
+                        sd.wait()
+                    except Exception:
+                        pass
+                except Exception:
+                    # Last resort: write temp file and block until user can play
+                    try:
+                        import tempfile
+                        temp_dir = Path(tempfile.gettempdir())
+                        temp_file = temp_dir / f"stream_seg_{int(time.time() * 1000)}.wav"
+                        sf.write(str(temp_file), audio_np, sr)
+                        print(f"Saved segment to {temp_file} — open it in your media player to hear streamed audio.")
+                    except Exception:
+                        print("Unable to play segment; skipping.")
+
+            # Inter-segment delay
+            if stream_delay and stream_delay > 0 and not stop_event.is_set():
+                elapsed = 0.0
+                while elapsed < stream_delay and not stop_event.is_set():
+                    time.sleep(0.05)
+                    elapsed += 0.05
+            # If stop_event is set, try to stop any handles
+            if stop_event.is_set():
+                try:
+                    _stop_play_handles(play_handles)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"Playback worker error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 def save_audio_with_retry(audio_data: np.ndarray, sample_rate: int, output_path: PathLike, max_retries: int = MAX_RETRIES, retry_delay: float = RETRY_DELAY) -> bool:
     """
     Attempt to save audio data to file with retry logic.
@@ -539,16 +709,40 @@ def main() -> None:
                     producer = threading.Thread(target=_prefetch_generator_to_queue, args=(generator, q, stop_event), daemon=True)
                     producer.start()
 
+                    # Playback queue and controls
+                    play_queue = Queue()
+                    pause_event = threading.Event()  # when set -> paused
+                    ctrl_stop_event = threading.Event()
+                    playback = None
+                    listener = None
+                    if stream:
+                        playback = threading.Thread(target=_playback_worker, args=(play_queue, pause_event, ctrl_stop_event, play_handles, stream_delay), daemon=True)
+                        playback.start()
+                        # Start control listener (pause/interrupt)
+                        listener = threading.Thread(target=_control_listener, args=(interrupt_event if 'interrupt_event' in locals() else threading.Event(), pause_event, ctrl_stop_event), daemon=True)
+                        listener.start()
+
                     with tqdm(desc="Generating speech") as pbar:
                         while True:
                             gs, ps, audio = q.get()
 
                             # Check for sentinel / end / errors
                             if gs is None and ps is None and audio is None:
+                                # signal playback that generation finished
+                                if stream:
+                                    try:
+                                        play_queue.put(None)
+                                    except Exception:
+                                        pass
                                 break
                             if gs == "__ERR__":
                                 print(f"Error while generating segment: {ps}")
                                 stop_event.set()
+                                if stream:
+                                    try:
+                                        play_queue.put(None)
+                                    except Exception:
+                                        pass
                                 break
 
                             if audio is not None:
@@ -557,29 +751,13 @@ def main() -> None:
                                 print(f"\nGenerated segment: {gs}")
                                 if ps:
                                     print(f"Phonemes: {ps}")
-                                # Play the segment immediately if streaming was requested
+                                # Enqueue segment for the playback worker if streaming
                                 if stream:
                                     try:
                                         audio_np = audio_tensor.numpy()
-                                        handle, method = play_audio_segment(audio_np, SAMPLE_RATE, play_handles)
-                                        # Delay or wait to avoid cutting mid-sentence; producer keeps
-                                        # generating the next segment while we wait here.
-                                        if stream_delay is not None:
-                                            try:
-                                                if stream_delay == 0:
-                                                    if method == 'simpleaudio' and handle is not None:
-                                                        handle.wait_done()
-                                                    elif method == 'sounddevice':
-                                                        import sounddevice as sd
-                                                        sd.wait()
-                                                    else:
-                                                        time.sleep(0.5)
-                                                else:
-                                                    time.sleep(max(0.0, stream_delay))
-                                            except Exception:
-                                                time.sleep(max(0.0, stream_delay or 0.2))
+                                        play_queue.put((audio_np, SAMPLE_RATE))
                                     except Exception as e:
-                                        print(f"Error while attempting to play segment: {e}")
+                                        print(f"Error while enqueueing segment for playback: {e}")
                                 pbar.update(1)
 
                     # Ensure producer thread is stopped
@@ -783,6 +961,19 @@ def main() -> None:
                                 listener.join(timeout=0.5)
                             except Exception:
                                 pass
+
+                        # Stop playback worker if running
+                        try:
+                            ctrl_stop_event.set()
+                            if playback is not None:
+                                # Push sentinel to tell playback to exit
+                                try:
+                                    play_queue.put(None)
+                                except Exception:
+                                    pass
+                                playback.join(timeout=1)
+                        except Exception:
+                            pass
 
                         generation_complete = True
 
