@@ -289,6 +289,17 @@ def _cli_stdout_reader(pipe, out_q, stop_event):
         pass
 
 
+def _cli_stderr_reader(pipe, err_q, stop_event):
+    """Read stderr lines from subprocess and push them to a queue for diagnostics."""
+    try:
+        for ln in iter(pipe.readline, ''):
+            if stop_event.is_set():
+                break
+            err_q.put(ln)
+    except Exception:
+        pass
+
+
 def ollama_cli_chat_mode(tts_model, device, model_name: str = 'neural-chat', ollama_cmd: str = 'ollama'):
     """Use the `ollama run <model>` CLI to interact directly (streaming via stdout).
 
@@ -308,10 +319,14 @@ def ollama_cli_chat_mode(tts_model, device, model_name: str = 'neural-chat', oll
 
     stop_event = threading.Event()
     out_q = _queue.Queue()
-    reader = threading.Thread(target=_cli_stdout_reader, args=(proc.stdout, out_q, stop_event), daemon=True)
-    reader.start()
+    err_q = _queue.Queue()
 
-    # Consume initial banner until prompt
+    reader = threading.Thread(target=_cli_stdout_reader, args=(proc.stdout, out_q, stop_event), daemon=True)
+    err_reader = threading.Thread(target=_cli_stderr_reader, args=(proc.stderr, err_q, stop_event), daemon=True)
+    reader.start()
+    err_reader.start()
+
+    # Collect initial banner until prompt
     initial = []
     prompt_seen = False
     while not prompt_seen:
@@ -328,6 +343,16 @@ def ollama_cli_chat_mode(tts_model, device, model_name: str = 'neural-chat', oll
         if ln.strip().startswith('>>>'):
             continue
         print(ln, end='')
+
+    # Track recent stderr for debugging
+    from collections import deque
+    recent_err = deque(maxlen=20)
+    def _drain_stderr_now():
+        while not err_q.empty():
+            try:
+                recent_err.append(err_q.get_nowait())
+            except Exception:
+                break
 
     print("Type your messages; empty message exits CLI mode. Use '/q' to quit the underlying process.")
     tts_enabled = get_yes_no("Also speak responses with TTS?", default=False)
@@ -369,21 +394,45 @@ def ollama_cli_chat_mode(tts_model, device, model_name: str = 'neural-chat', oll
 
             # Stream response until the CLI prompt reappears
             buffer = ""
+            got_output = False
+            sent_time = time.time()
+            inactivity_timeout = 12.0  # seconds without any output before we warn
             while True:
+                now = time.time()
                 try:
-                    ln = out_q.get(timeout=0.1)
+                    ln = out_q.get(timeout=0.2)
+                    got_output = True
+                    sent_time = now
                 except Exception:
-                    # check process state
+                    # check process state and inactivity
                     if proc.poll() is not None:
                         print("\nOllama process exited unexpectedly.")
                         stop_event.set()
                         break
+                    if not got_output and (now - sent_time) > inactivity_timeout:
+                        # No output seen for a while — print helpful diagnostics
+                        print(f"\nNo response from Ollama after {int(inactivity_timeout)}s. Draining stderr for clues:")
+                        _drain_stderr_now()
+                        if recent_err:
+                            for ln in recent_err:
+                                print("[ollama stderr] ", ln, end='')
+                        else:
+                            print("(no stderr output available)")
+                        # Offer to continue waiting or abort
+                        resp = input("Continue waiting? (y/N): ").strip().lower()
+                        if resp in ('y','yes'):
+                            sent_time = time.time()
+                            continue
+                        else:
+                            print("Aborting wait for this response.")
+                            break
                     continue
+
                 if ln.strip().startswith('>>>'):
                     # CLI prompt -> assistant finished
                     break
                 # Filter out helper lines
-                if ln.strip() == '' or 'Use' in ln and 'help' in ln:
+                if ln.strip() == '' or ('Use' in ln and 'help' in ln):
                     continue
                 # Print and optionally speak chunk
                 print(ln, end='', flush=True)
