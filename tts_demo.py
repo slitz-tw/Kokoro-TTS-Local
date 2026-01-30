@@ -16,6 +16,7 @@ import threading
 import queue as _queue
 import shutil
 import signal
+import argparse
 
 # Define path type for consistent handling
 PathLike = Union[str, Path]
@@ -353,6 +354,25 @@ def ollama_cli_chat_mode(tts_model, device, model_name: str = 'neural-chat', oll
                 recent_err.append(err_q.get_nowait())
             except Exception:
                 break
+
+
+def ollama_cli_send_once(message: str, model_name: str = 'neural-chat', ollama_cmd: str = 'ollama') -> str:
+    """Run `ollama run <model> <message>` once and return stdout as a string.
+
+    Useful for non-interactive, piped invocations where stdin/TTY is not
+    available to support interactive modes.
+    """
+    try:
+        # Quote the message as a single argument; let subprocess handle spaces
+        proc = subprocess.run([ollama_cmd, 'run', model_name, message], capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            err = proc.stderr.strip() or '<no stderr>'
+            raise RuntimeError(f"Ollama returned exit code {proc.returncode}: {err}")
+        return proc.stdout
+    except FileNotFoundError:
+        raise RuntimeError(f"`{ollama_cmd}` not found on PATH")
+    except Exception as e:
+        raise
 
     print("Type your messages; empty message exits CLI mode. Use '/q' to quit the underlying process.")
     tts_enabled = get_yes_no("Also speak responses with TTS?", default=False)
@@ -975,8 +995,36 @@ def save_audio_with_retry(audio_data: np.ndarray, sample_rate: int, output_path:
 def main() -> None:
     import psutil
     import gc
-    
+    import argparse as _argparse
+
+    # Minimal CLI for non-interactive use
+    parser = _argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--ollama-send', '-os', nargs='+', help='Send a single message to local ollama CLI and exit')
+    parser.add_argument('--ollama-model', '-om', default='neural-chat', help='Ollama model name (default: neural-chat)')
+    parser.add_argument('--ollama-cli', action='store_true', help='Force using ollama CLI for send')
+    parser.add_argument('--tts', action='store_true', help='If used with --ollama-send, speak the response via TTS')
+    args, _ = parser.parse_known_args()
+
     try:
+        # Non-interactive: handle --ollama-send quickly and exit
+        if args.ollama_send:
+            msg = ' '.join(args.ollama_send)
+            try:
+                out = ollama_cli_send_once(msg, model_name=args.ollama_model)
+                print(out)
+                if args.tts:
+                    # Build the model so we can TTS
+                    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                    print(f"Using device: {device}")
+                    model = build_model(DEFAULT_MODEL_PATH, device)
+                    play_handles = []
+                    # simple TTS of full response
+                    _synthesize_and_play_text_chunk(out, model, Path('voices').resolve() / 'af_bella.pt', DEFAULT_SPEED, play_handles)
+                return
+            except Exception as e:
+                print(f"Error sending to Ollama CLI: {e}")
+                return
+
         # Check system memory at startup
         memory = psutil.virtual_memory()
         available_gb = memory.available / (1024**3)
