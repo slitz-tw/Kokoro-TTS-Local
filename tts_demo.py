@@ -63,20 +63,67 @@ def print_menu():
     print("3. Generate speech from EPUB/PDF file")
     print("4. Exit")
     return input("Select an option (1-4): ").strip()
-def extract_text_from_epub(epub_path: PathLike) -> str:
+def extract_text_from_epub(epub_path: PathLike, select_chapter: bool = False) -> str:
+    """Extract text from an EPUB file.
+
+    If select_chapter is True and multiple document items are present, the
+    user will be shown a numbered list of chapters (title + preview) and can
+    choose a single chapter, 'a' for all chapters, or press Enter to cancel.
+    """
     from ebooklib import epub
     import ebooklib
     from bs4 import BeautifulSoup
+
     book = epub.read_epub(str(epub_path))
-    text = []
-    for item in book.get_items():
-        # Prefer the numeric constant from the top-level ebooklib module, which
-        # is always available (some versions don't expose ITEM_DOCUMENT on the
-        # epub submodule).
-        if item.get_type() == ebooklib.ITEM_DOCUMENT:
+
+    # Collect document items in reading order
+    doc_items = [it for it in book.get_items() if it.get_type() == ebooklib.ITEM_DOCUMENT]
+
+    if not doc_items:
+        return ""
+
+    # If the user requested chapter selection and there are multiple items,
+    # present a compact preview list and allow choosing one.
+    if select_chapter and len(doc_items) > 1:
+        chapters = []
+        for item in doc_items:
             soup = BeautifulSoup(item.get_content(), 'html.parser')
-            text.append(soup.get_text())
-    return '\n'.join(text)
+            # Prefer heading or title tags for a readable chapter title
+            title_tag = soup.find(['h1', 'h2', 'title'])
+            title = title_tag.get_text(strip=True) if title_tag and title_tag.get_text(strip=True) else (item.get_name() or item.file_name or 'Untitled')
+            preview = soup.get_text(separator=' ', strip=True)
+            preview = ' '.join(preview.split())[:140]
+            chapters.append((title, preview, item))
+
+        print("\nFound the following chapters in the EPUB:")
+        for i, (title, preview, _) in enumerate(chapters, 1):
+            ell = '...' if len(preview) > 100 else ''
+            print(f"{i}. {title} — {preview[:100]}{ell}")
+        print("\nEnter a chapter number to use, 'a' for all chapters, or press Enter to cancel:")
+        while True:
+            choice = input('> ').strip().lower()
+            if not choice:
+                print("No chapter selected; canceling EPUB import.")
+                return ""
+            if choice in ('a', 'all'):
+                break
+            try:
+                idx = int(choice)
+                if 1 <= idx <= len(chapters):
+                    sel_item = chapters[idx - 1][2]
+                    sel_soup = BeautifulSoup(sel_item.get_content(), 'html.parser')
+                    return sel_soup.get_text(separator='\n', strip=True)
+                else:
+                    print(f"Invalid choice: {choice}. Please enter a number between 1 and {len(chapters)}, 'a', or Enter to cancel.")
+            except ValueError:
+                print("Please enter a valid number, 'a' for all, or press Enter to cancel.")
+
+    # Default: concatenate all document items in order
+    parts = []
+    for item in doc_items:
+        soup = BeautifulSoup(item.get_content(), 'html.parser')
+        parts.append(soup.get_text())
+    return '\n'.join(parts)
 
 def extract_text_from_pdf(pdf_path: PathLike) -> str:
     import PyPDF2
@@ -579,12 +626,12 @@ def main() -> None:
                 ext = os.path.splitext(file_path)[1].lower()
                 try:
                     if ext == ".epub":
-                        text = extract_text_from_epub(file_path)
-                    elif ext == ".pdf":
-                        text = extract_text_from_pdf(file_path)
-                    else:
-                        print("Unsupported file type. Please provide an EPUB or PDF file.")
-                        continue
+                            text = extract_text_from_epub(file_path, select_chapter=True)
+                        elif ext == ".pdf":
+                            text = extract_text_from_pdf(file_path)
+                        else:
+                            print("Unsupported file type. Please provide an EPUB or PDF file.")
+                            continue
                 except Exception as e:
                     print(f"Error extracting text: {e}")
                     continue
