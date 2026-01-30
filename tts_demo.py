@@ -11,6 +11,11 @@ import os
 import sys
 import requests
 import json
+import subprocess
+import threading
+import queue as _queue
+import shutil
+import signal
 
 # Define path type for consistent handling
 PathLike = Union[str, Path]
@@ -225,7 +230,7 @@ def get_yes_no(prompt: str, default: bool = False) -> bool:
 
 
 def ollama_is_available(ollama_url: str = 'http://localhost:11434') -> bool:
-    """Quick check whether Ollama appears reachable."""
+    """Quick check whether Ollama appears reachable via HTTP API."""
     try:
         r = requests.get(ollama_url + '/api/health', timeout=1)
         return r.status_code == 200
@@ -235,6 +240,147 @@ def ollama_is_available(ollama_url: str = 'http://localhost:11434') -> bool:
             return r.status_code == 200
         except Exception:
             return False
+
+
+def ollama_cli_available(ollama_cmd: str = 'ollama') -> bool:
+    """Return True if the local `ollama` CLI appears callable."""
+    if shutil.which(ollama_cmd) is None:
+        return False
+    try:
+        # quick command to list models
+        proc = subprocess.run([ollama_cmd, 'list'], capture_output=True, text=True, timeout=2)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _cli_stdout_reader(pipe, out_q, stop_event):
+    """Read stdout from subprocess and push lines to a queue."""
+    try:
+        for ln in iter(pipe.readline, ''):
+            out_q.put(ln)
+            if stop_event.is_set():
+                break
+    except Exception:
+        pass
+
+
+def ollama_cli_chat_mode(tts_model, device, model_name: str = 'neural-chat', ollama_cmd: str = 'ollama'):
+    """Use the `ollama run <model>` CLI to interact directly (streaming via stdout).
+
+    This avoids the HTTP API and connects to the local model via the CLI process.
+    """
+    print(f"\nStarting Ollama CLI chat mode (model: {model_name}) using `{ollama_cmd}`")
+
+    if not ollama_cli_available(ollama_cmd):
+        print(f"The `{ollama_cmd}` CLI wasn't found or failed to run. Please install or configure it.")
+        return
+
+    try:
+        proc = subprocess.Popen([ollama_cmd, 'run', model_name], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    except Exception as e:
+        print(f"Error launching `{ollama_cmd}`: {e}")
+        return
+
+    stop_event = threading.Event()
+    out_q = _queue.Queue()
+    reader = threading.Thread(target=_cli_stdout_reader, args=(proc.stdout, out_q, stop_event), daemon=True)
+    reader.start()
+
+    # Consume initial banner until prompt
+    initial = []
+    prompt_seen = False
+    while not prompt_seen:
+        try:
+            ln = out_q.get(timeout=2)
+        except Exception:
+            break
+        initial.append(ln)
+        if ln.strip().startswith('>>>') or 'Send a message' in ln:
+            prompt_seen = True
+            break
+    # print any banner lines (except the '>>> ' prompt)
+    for ln in initial:
+        if ln.strip().startswith('>>>'):
+            continue
+        print(ln, end='')
+
+    print("Type your messages; empty message exits CLI mode. Use '/q' to quit the underlying process.")
+    tts_enabled = get_yes_no("Also speak responses with TTS?", default=False)
+    voice = None
+    speed = DEFAULT_SPEED
+    play_handles = []
+    voice_path = None
+    if tts_enabled:
+        voices = list_available_voices()
+        voice = select_voice(voices)
+        voice_path = Path("voices").resolve() / f"{voice}.pt"
+        if not voice_path.exists():
+            print(f"Voice not found: {voice_path}. Disabling TTS.")
+            tts_enabled = False
+        else:
+            speed = get_speed()
+
+    try:
+        while True:
+            user_prompt = input("\nYou: ").strip()
+            if not user_prompt:
+                print("Exiting Ollama CLI chat mode.")
+                break
+            if user_prompt.strip() == '/q':
+                print("Quitting underlying Ollama process.")
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                break
+
+            # send prompt to process
+            try:
+                proc.stdin.write(user_prompt + "\n")
+                proc.stdin.flush()
+            except Exception as e:
+                print(f"Error sending to process: {e}")
+                break
+
+            # Stream response until the CLI prompt reappears
+            buffer = ""
+            while True:
+                try:
+                    ln = out_q.get(timeout=0.1)
+                except Exception:
+                    # check process state
+                    if proc.poll() is not None:
+                        print("\nOllama process exited unexpectedly.")
+                        stop_event.set()
+                        break
+                    continue
+                if ln.strip().startswith('>>>'):
+                    # CLI prompt -> assistant finished
+                    break
+                # Filter out helper lines
+                if ln.strip() == '' or 'Use' in ln and 'help' in ln:
+                    continue
+                # Print and optionally speak chunk
+                print(ln, end='', flush=True)
+                chunk = ln
+                buffer += chunk
+                if tts_enabled:
+                    _synthesize_and_play_text_chunk(chunk, tts_model, voice_path, speed, play_handles)
+            # end of response
+            # small pause to allow playback to finish if needed
+    except KeyboardInterrupt:
+        print("\nExiting Ollama CLI chat mode (keyboard interrupt).")
+    finally:
+        stop_event.set()
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            reader.join(timeout=0.5)
+        except Exception:
+            pass
 
 
 def _synthesize_and_play_text_chunk(text: str, tts_model, voice_path: Path, speed: float, play_handles: list, sample_rate: int = SAMPLE_RATE):
@@ -260,7 +406,17 @@ def ollama_stream_chat_mode(tts_model, device, ollama_url: str = 'http://localho
     """Interactive chat that streams responses from an Ollama model and optionally TTSs them."""
     print(f"\nEntering Ollama streaming chat mode (model: {model_name})")
     if not ollama_is_available(ollama_url):
-        print(f"Could not reach Ollama at {ollama_url}. Ensure the service is running.")
+        print(f"Could not reach Ollama at {ollama_url}.")
+        # Offer CLI fallback when HTTP API is not available
+        try:
+            if ollama_cli_available():
+                use_cli = get_yes_no("HTTP API not reachable — use local `ollama` CLI instead (no HTTP)?", default=True)
+                if use_cli:
+                    ollama_cli_chat_mode(tts_model, device, model_name=model_name)
+                    return
+        except Exception:
+            pass
+        print("Ensure the Ollama HTTP service is running, or install/configure the `ollama` CLI.")
         return
     print("Type your messages and press Enter. Empty message returns to menu.")
     tts_enabled = get_yes_no("Also speak responses with TTS?", default=False)
