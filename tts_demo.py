@@ -13,8 +13,8 @@ import sys
 # Define path type for consistent handling
 PathLike = Union[str, Path]
 # Constants
-MAX_GENERATION_TIME = 300  # seconds
-MIN_GENERATION_TIME = 60   # seconds
+MAX_GENERATION_TIME = None  # No limit when None
+MIN_GENERATION_TIME = None   # No per-segment limit when None
 DEFAULT_SAMPLE_RATE = 24000
 MIN_SPEED = 0.1
 MAX_SPEED = 3.0
@@ -267,30 +267,84 @@ def _prefetch_generator_to_queue(gen, out_queue, stop_event):
     Each item pushed is a tuple (gs, ps, audio_np_or_tensor). When generator
     finishes, a sentinel (None, None, None) will be pushed. If an exception
     occurs, a tuple ('__ERR__', exception, None) will be pushed.
+
+    The function checks `stop_event` so the producer can be cancelled by the
+    consumer or an external interrupt (e.g., user pressing the interrupt key).
     """
     try:
         for item in gen:
             if stop_event.is_set():
                 break
-            # Ensure we don't block forever if the consumer dies; use timeout
             pushed = False
             while not stop_event.is_set() and not pushed:
                 try:
-                    out_queue.put(item, timeout=0.5)
+                    out_queue.put(item)
                     pushed = True
                 except Exception:
                     # queue.Full or other transient error; check stop_event
                     continue
     except Exception as e:
         try:
-            out_queue.put(("__ERR__", e, None), timeout=1)
+            out_queue.put(("__ERR__", e, None))
         except Exception:
             pass
     finally:
         try:
-            out_queue.put((None, None, None), timeout=1)
+            out_queue.put((None, None, None))
         except Exception:
             pass
+
+
+def _interrupt_listener(interrupt_event, stop_event):
+    """Background listener that sets `interrupt_event` when the user requests an interrupt.
+
+    On Windows, uses msvcrt.kbhit/getwch for non-blocking key detection. The
+    listener checks for 'i' or 'I' to signal an interrupt and exits when
+    `stop_event` is set.
+    """
+    try:
+        import msvcrt
+    except Exception:
+        # Fallback: no non-blocking console input available
+        return
+
+    print("(Streaming) Press 'i' to interrupt and choose another chapter.")
+    while not stop_event.is_set() and not interrupt_event.is_set():
+        try:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch.lower() == 'i':
+                    interrupt_event.set()
+                    print("\nInterrupt requested by user.")
+                    break
+        except Exception:
+            # Avoid noisy errors from console
+            pass
+        time.sleep(0.05)
+
+
+def _stop_play_handles(play_handles):
+    """Attempt to stop currently playing playback handles.
+
+    Handles can be simpleaudio PlayObject, string paths (no-op), or None.
+    For sounddevice, we call sd.stop() to halt playback.
+    """
+    try:
+        # stop simpleaudio handles
+        for h in play_handles:
+            try:
+                if hasattr(h, 'stop'):
+                    h.stop()
+            except Exception:
+                pass
+        # stop sounddevice global playback if available
+        try:
+            import sounddevice as sd
+            sd.stop()
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def save_audio_with_retry(audio_data: np.ndarray, sample_rate: int, output_path: PathLike, max_retries: int = MAX_RETRIES, retry_delay: float = RETRY_DELAY) -> bool:
@@ -465,21 +519,16 @@ def main() -> None:
                 try:
                     import threading
                     generation_complete = False
-                    def watchdog_timer():
-                        if not generation_complete:
-                            print("\nWatchdog: Generation taking too long, process will be cancelled")
-                    watchdog = threading.Timer(max_gen_time, watchdog_timer)
-                    watchdog.daemon = True
-                    watchdog.start()
+                    # No watchdog timer (unlimited generation allowed)
                     try:
                         generator = model(text, voice=str(voice_path), speed=speed, split_pattern=r'\n+')
                     except (ValueError, TypeError, RuntimeError) as e:
                         print(f"Error initializing speech generator: {e}")
-                        watchdog.cancel()
+                        # watchdog removed (no time limits)
                         continue
                     except Exception as e:
                         print(f"Unexpected error initializing generator: {type(e).__name__}: {e}")
-                        watchdog.cancel()
+                        # watchdog removed (no time limits)
                         continue
 
                     # When streaming, prefetch the next segment in a background thread so
@@ -492,16 +541,7 @@ def main() -> None:
 
                     with tqdm(desc="Generating speech") as pbar:
                         while True:
-                            try:
-                                gs, ps, audio = q.get(timeout=1)
-                            except Exception:
-                                # Timeout — check for watchdog/time limits
-                                current_time = time.time()
-                                if current_time - start_time > max_gen_time:
-                                    print("\nWarning: Total generation time exceeded limit, stopping")
-                                    stop_event.set()
-                                    break
-                                continue
+                            gs, ps, audio = q.get()
 
                             # Check for sentinel / end / errors
                             if gs is None and ps is None and audio is None:
@@ -510,19 +550,6 @@ def main() -> None:
                                 print(f"Error while generating segment: {ps}")
                                 stop_event.set()
                                 break
-
-                            current_time = time.time()
-                            if current_time - start_time > max_gen_time:
-                                print("\nWarning: Total generation time exceeded limit, stopping")
-                                stop_event.set()
-                                break
-
-                            segment_elapsed = current_time - segment_start_time
-                            if segment_elapsed > max_segment_time:
-                                print(f"\nWarning: Segment took too long ({segment_elapsed:.1f}s), stopping")
-                                stop_event.set()
-                                break
-                            segment_start_time = current_time
 
                             if audio is not None:
                                 audio_tensor = audio if isinstance(audio, torch.Tensor) else torch.from_numpy(audio).float()
@@ -562,7 +589,7 @@ def main() -> None:
                     except Exception:
                         pass
                     generation_complete = True
-                    watchdog.cancel()
+                    # watchdog removed (no time limits)
                 except ValueError as e:
                     print(f"Value error during speech generation: {e}")
                 except RuntimeError as e:
@@ -654,157 +681,183 @@ def main() -> None:
                 print(f"\nGenerating speech from file: {file_path}")
                 print(f"Using voice: {voice}")
                 print(f"Speed: {speed}x")
-                all_audio = []
-                play_handles = []
                 voice_path = Path("voices").resolve() / f"{voice}.pt"
                 if not voice_path.exists():
                     print(f"Error: Voice file not found: {voice_path}")
                     continue
-                max_gen_time = MAX_GENERATION_TIME
-                max_segment_time = MIN_GENERATION_TIME
-                start_time = time.time()
-                segment_start_time = start_time
-                try:
-                    import threading
-                    generation_complete = False
-                    def watchdog_timer():
-                        if not generation_complete:
-                            print("\nWatchdog: Generation taking too long, process will be cancelled")
-                    watchdog = threading.Timer(max_gen_time, watchdog_timer)
-                    watchdog.daemon = True
-                    watchdog.start()
+
+                # Allow restarting with a different chapter on interrupt
+                current_text = text
+                while True:
+                    all_audio = []
+                    play_handles = []
+                    start_time = time.time()
+                    segment_start_time = start_time
+
                     try:
-                        generator = model(text, voice=str(voice_path), speed=speed, split_pattern=r'\n+')
-                    except (ValueError, TypeError, RuntimeError) as e:
-                        print(f"Error initializing speech generator: {e}")
-                        watchdog.cancel()
-                        continue
-                    except Exception as e:
-                        print(f"Unexpected error initializing generator: {type(e).__name__}: {e}")
-                        watchdog.cancel()
-                        continue
+                        import threading
+                        generation_complete = False
 
-                    # Prefetch producer/consumer queue to generate the next segment while
-                    # the current one is being played
-                    from queue import Queue
-                    q = Queue(maxsize=2)
-                    stop_event = threading.Event()
-                    producer = threading.Thread(target=_prefetch_generator_to_queue, args=(generator, q, stop_event), daemon=True)
-                    producer.start()
+                        try:
+                            generator = model(current_text, voice=str(voice_path), speed=speed, split_pattern=r'\n+')
+                        except (ValueError, TypeError, RuntimeError) as e:
+                            print(f"Error initializing speech generator: {e}")
+                            continue
+                        except Exception as e:
+                            print(f"Unexpected error initializing generator: {type(e).__name__}: {e}")
+                            continue
 
-                    with tqdm(desc="Generating speech") as pbar:
-                        while True:
-                            try:
-                                gs, ps, audio = q.get(timeout=1)
-                            except Exception:
-                                current_time = time.time()
-                                if current_time - start_time > max_gen_time:
-                                    print("\nWarning: Total generation time exceeded limit, stopping")
+                        # Prefetch producer/consumer queue
+                        from queue import Queue
+                        q = Queue(maxsize=2)
+                        stop_event = threading.Event()
+                        interrupt_event = threading.Event()
+
+                        producer = threading.Thread(target=_prefetch_generator_to_queue, args=(generator, q, stop_event), daemon=True)
+                        producer.start()
+
+                        # Start interrupt listener when streaming is active
+                        listener = None
+                        if stream:
+                            listener = threading.Thread(target=_interrupt_listener, args=(interrupt_event, stop_event), daemon=True)
+                            listener.start()
+
+                        with tqdm(desc="Generating speech") as pbar:
+                            while True:
+                                # If the user requested an interrupt, stop producing and break
+                                if interrupt_event.is_set():
+                                    print("\nInterrupt detected; stopping generation...")
                                     stop_event.set()
                                     break
-                                continue
 
-                            # detect end of generation
-                            if gs is None and ps is None and audio is None:
-                                break
-                            if gs == "__ERR__":
-                                print(f"Error while generating segment: {ps}")
-                                stop_event.set()
-                                break
+                                try:
+                                    gs, ps, audio = q.get()
+                                except Exception:
+                                    # Queue get blocking; continue to check interrupt
+                                    continue
 
-                            current_time = time.time()
-                            if current_time - start_time > max_gen_time:
-                                print("\nWarning: Total generation time exceeded limit, stopping")
-                                stop_event.set()
-                                break
+                                # detect end of generation
+                                if gs is None and ps is None and audio is None:
+                                    break
+                                if gs == "__ERR__":
+                                    print(f"Error while generating segment: {ps}")
+                                    stop_event.set()
+                                    break
 
-                            segment_elapsed = current_time - segment_start_time
-                            if segment_elapsed > max_segment_time:
-                                print(f"\nWarning: Segment took too long ({segment_elapsed:.1f}s), stopping")
-                                stop_event.set()
-                                break
-                            segment_start_time = current_time
-
-                            if audio is not None:
-                                audio_tensor = audio if isinstance(audio, torch.Tensor) else torch.from_numpy(audio).float()
-                                all_audio.append(audio_tensor)
-                                print(f"\nGenerated segment: {gs}")
-                                if ps:
-                                    print(f"Phonemes: {ps}")
-                                if stream:
-                                    try:
-                                        audio_np = audio_tensor.numpy()
-                                        handle, method = play_audio_segment(audio_np, SAMPLE_RATE, play_handles)
-                                        if stream_delay is not None:
-                                            try:
-                                                if stream_delay == 0:
-                                                    if method == 'simpleaudio' and handle is not None:
-                                                        handle.wait_done()
-                                                    elif method == 'sounddevice':
-                                                        import sounddevice as sd
-                                                        sd.wait()
+                                if audio is not None:
+                                    audio_tensor = audio if isinstance(audio, torch.Tensor) else torch.from_numpy(audio).float()
+                                    all_audio.append(audio_tensor)
+                                    print(f"\nGenerated segment: {gs}")
+                                    if ps:
+                                        print(f"Phonemes: {ps}")
+                                    if stream:
+                                        try:
+                                            audio_np = audio_tensor.numpy()
+                                            handle, method = play_audio_segment(audio_np, SAMPLE_RATE, play_handles)
+                                            if stream_delay is not None:
+                                                try:
+                                                    if stream_delay == 0:
+                                                        if method == 'simpleaudio' and handle is not None:
+                                                            handle.wait_done()
+                                                        elif method == 'sounddevice':
+                                                            import sounddevice as sd
+                                                            sd.wait()
+                                                        else:
+                                                            time.sleep(0.5)
                                                     else:
-                                                        time.sleep(0.5)
-                                                else:
-                                                    time.sleep(max(0.0, stream_delay))
-                                            except Exception:
-                                                time.sleep(max(0.0, stream_delay or 0.2))
-                                    except Exception as e:
-                                        print(f"Error while attempting to play segment: {e}")
-                                pbar.update(1)
+                                                        time.sleep(max(0.0, stream_delay))
+                                                except Exception:
+                                                    time.sleep(max(0.0, stream_delay or 0.2))
+                                        except Exception as e:
+                                            print(f"Error while attempting to play segment: {e}")
+                                    pbar.update(1)
 
-                    stop_event.set()
-                    try:
-                        producer.join(timeout=1)
-                    except Exception:
-                        pass
-                    generation_complete = True
-                    watchdog.cancel()
-                except ValueError as e:
-                    print(f"Value error during speech generation: {e}")
-                except RuntimeError as e:
-                    print(f"Runtime error during speech generation: {e}")
-                    if "CUDA out of memory" in str(e):
-                        print("CUDA out of memory error - try using a shorter text or switching to CPU")
-                except KeyError as e:
-                    print(f"Key error during speech generation: {e}")
-                    print("This might be caused by a missing voice configuration")
-                except FileNotFoundError as e:
-                    print(f"File not found: {e}")
-                except Exception as e:
-                    print(f"Unexpected error during speech generation: {type(e).__name__}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                if stream and play_handles:
-                    try:
-                        for h in play_handles:
-                            if h is not None and hasattr(h, 'wait_done'):
-                                h.wait_done()
-                    except Exception:
-                        pass
-                if all_audio:
-                    try:
-                        if len(all_audio) == 1:
-                            final_audio = all_audio[0]
-                        else:
+                        # Clean up producer/listener
+                        stop_event.set()
+                        try:
+                            producer.join(timeout=1)
+                        except Exception:
+                            pass
+                        if listener is not None:
                             try:
-                                final_audio = torch.cat(all_audio, dim=0)
-                            except RuntimeError as e:
-                                print(f"Error concatenating audio segments: {e}")
-                                continue
-                        output_path = DEFAULT_OUTPUT_FILE
-                        if save_audio_with_retry(final_audio.numpy(), SAMPLE_RATE, output_path):
-                            print(f"\nAudio saved to {output_path}")
-                            try:
-                                print('\a')
-                            except:
+                                listener.join(timeout=0.5)
+                            except Exception:
                                 pass
-                        else:
-                            print("Failed to save audio file")
+
+                        generation_complete = True
+
+                    except ValueError as e:
+                        print(f"Value error during speech generation: {e}")
+                    except RuntimeError as e:
+                        print(f"Runtime error during speech generation: {e}")
+                        if "CUDA out of memory" in str(e):
+                            print("CUDA out of memory error - try using a shorter text or switching to CPU")
+                    except KeyError as e:
+                        print(f"Key error during speech generation: {e}")
+                        print("This might be caused by a missing voice configuration")
+                    except FileNotFoundError as e:
+                        print(f"File not found: {e}")
                     except Exception as e:
-                        print(f"Error processing audio: {type(e).__name__}: {e}")
-                else:
-                    print("Error: Failed to generate audio")
+                        print(f"Unexpected error during speech generation: {type(e).__name__}: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+                    # If streaming, wait for any non-blocking players to finish playback
+                    if stream and play_handles:
+                        try:
+                            for h in play_handles:
+                                if h is not None and hasattr(h, 'wait_done'):
+                                    h.wait_done()
+                        except Exception:
+                            pass
+
+                    # If the user interrupted, give them choices (only relevant for EPUBs)
+                    if 'interrupt_event' in locals() and interrupt_event.is_set():
+                        # Stop any active audio playback
+                        _stop_play_handles(play_handles)
+                        print("\nStreaming interrupted. Options:\n  c - choose another chapter\n  r - restart this chapter\n  Enter - cancel and return to menu")
+                        choice2 = input('> ').strip().lower()
+                        if choice2 == 'c':
+                            # Re-run chapter selection
+                            new_text = extract_text_from_epub(file_path, select_chapter=True)
+                            if not new_text.strip():
+                                print("No chapter selected; returning to menu.")
+                                break
+                            current_text = new_text
+                            print("Starting new chapter...")
+                            continue
+                        elif choice2 == 'r':
+                            print("Restarting current chapter...")
+                            continue
+                        else:
+                            print("Cancelled. Returning to main menu.")
+                            break
+
+                    # Otherwise proceed to save the generated audio
+                    if all_audio:
+                        try:
+                            if len(all_audio) == 1:
+                                final_audio = all_audio[0]
+                            else:
+                                try:
+                                    final_audio = torch.cat(all_audio, dim=0)
+                                except RuntimeError as e:
+                                    print(f"Error concatenating audio segments: {e}")
+                                    break
+                            output_path = DEFAULT_OUTPUT_FILE
+                            if save_audio_with_retry(final_audio.numpy(), SAMPLE_RATE, output_path):
+                                print(f"\nAudio saved to {output_path}")
+                                try:
+                                    print('\a')
+                                except:
+                                    pass
+                            else:
+                                print("Failed to save audio file")
+                        except Exception as e:
+                            print(f"Error processing audio: {type(e).__name__}: {e}")
+                    else:
+                        print("Error: Failed to generate audio")
+                    break
 
             elif choice == "4":
                 print("\nGoodbye!")
