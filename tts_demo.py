@@ -141,11 +141,37 @@ def get_stream_choice() -> bool:
         print("Please answer 'y' or 'n'.")
 
 
-def play_audio_segment(audio_np: np.ndarray, sample_rate: int, play_handles: list) -> None:
+def get_stream_delay() -> float:
+    """Get the inter-segment delay in seconds.
+
+    Enter 0 to wait until the segment playback finishes before continuing.
+    Default is 0.3 seconds.
+    """
+    while True:
+        val = input("\nInter-segment delay in seconds (enter 0 to wait until playback finishes) [default 0.3]: ").strip()
+        if val == "":
+            return 0.3
+        try:
+            f = float(val)
+            if f < 0:
+                print("Please enter a non-negative number.")
+                continue
+            return f
+        except ValueError:
+            print("Please enter a valid number (e.g., 0.2 or 0).")
+
+
+def play_audio_segment(audio_np: np.ndarray, sample_rate: int, play_handles: list):
     """Attempt to play an audio segment using available playback libraries.
 
     Tries in order: simpleaudio, sounddevice. If neither is available, writes
     the segment to a temp WAV and notifies the user.
+
+    Returns:
+        A tuple (handle_or_info, method) where method is one of:
+        'simpleaudio', 'sounddevice', 'file', or 'none'.
+        The handle_or_info may be a play handle (for simpleaudio), None
+        (for sounddevice), or a temp file path (for 'file').
     """
     # Normalize to float32 in range [-1,1]
     try:
@@ -161,7 +187,7 @@ def play_audio_segment(audio_np: np.ndarray, sample_rate: int, play_handles: lis
         data = (audio_np * 32767).astype(np.int16).tobytes()
         handle = sa.play_buffer(data, 1, 2, sample_rate)
         play_handles.append(handle)
-        return
+        return handle, 'simpleaudio'
     except Exception:
         pass
 
@@ -169,9 +195,8 @@ def play_audio_segment(audio_np: np.ndarray, sample_rate: int, play_handles: lis
     try:
         import sounddevice as sd
         sd.play(audio_np, sample_rate)
-        # No play handle to track; append None as placeholder
         play_handles.append(None)
-        return
+        return None, 'sounddevice'
     except Exception:
         pass
 
@@ -182,8 +207,43 @@ def play_audio_segment(audio_np: np.ndarray, sample_rate: int, play_handles: lis
         temp_file = temp_dir / f"stream_seg_{int(time.time() * 1000)}.wav"
         sf.write(str(temp_file), audio_np, sample_rate)
         print(f"Saved segment to {temp_file} — open it in your media player to hear streamed audio.")
+        play_handles.append(str(temp_file))
+        return str(temp_file), 'file'
     except Exception as e:
         print(f"Streaming unavailable and failed to save segment: {e}")
+        return None, 'none'
+
+
+def _prefetch_generator_to_queue(gen, out_queue, stop_event):
+    """Run the model generator in a background thread and push items to a queue.
+
+    Each item pushed is a tuple (gs, ps, audio_np_or_tensor). When generator
+    finishes, a sentinel (None, None, None) will be pushed. If an exception
+    occurs, a tuple ('__ERR__', exception, None) will be pushed.
+    """
+    try:
+        for item in gen:
+            if stop_event.is_set():
+                break
+            # Ensure we don't block forever if the consumer dies; use timeout
+            pushed = False
+            while not stop_event.is_set() and not pushed:
+                try:
+                    out_queue.put(item, timeout=0.5)
+                    pushed = True
+                except Exception:
+                    # queue.Full or other transient error; check stop_event
+                    continue
+    except Exception as e:
+        try:
+            out_queue.put(("__ERR__", e, None), timeout=1)
+        except Exception:
+            pass
+    finally:
+        try:
+            out_queue.put((None, None, None), timeout=1)
+        except Exception:
+            pass
 
 
 def save_audio_with_retry(audio_data: np.ndarray, sample_rate: int, output_path: PathLike, max_retries: int = MAX_RETRIES, retry_delay: float = RETRY_DELAY) -> bool:
@@ -341,6 +401,7 @@ def main() -> None:
                     continue
                 speed = get_speed()
                 stream = get_stream_choice()
+                stream_delay = get_stream_delay() if stream else None
                 print(f"\nGenerating speech for: '{text}'")
                 print(f"Using voice: {voice}")
                 print(f"Speed: {speed}x")
@@ -373,17 +434,49 @@ def main() -> None:
                         print(f"Unexpected error initializing generator: {type(e).__name__}: {e}")
                         watchdog.cancel()
                         continue
+
+                    # When streaming, prefetch the next segment in a background thread so
+                    # playback can start immediately without waiting for generation.
+                    from queue import Queue
+                    q = Queue(maxsize=2)
+                    stop_event = threading.Event()
+                    producer = threading.Thread(target=_prefetch_generator_to_queue, args=(generator, q, stop_event), daemon=True)
+                    producer.start()
+
                     with tqdm(desc="Generating speech") as pbar:
-                        for gs, ps, audio in generator:
+                        while True:
+                            try:
+                                gs, ps, audio = q.get(timeout=1)
+                            except Exception:
+                                # Timeout — check for watchdog/time limits
+                                current_time = time.time()
+                                if current_time - start_time > max_gen_time:
+                                    print("\nWarning: Total generation time exceeded limit, stopping")
+                                    stop_event.set()
+                                    break
+                                continue
+
+                            # Check for sentinel / end / errors
+                            if gs is None and ps is None and audio is None:
+                                break
+                            if gs == "__ERR__":
+                                print(f"Error while generating segment: {ps}")
+                                stop_event.set()
+                                break
+
                             current_time = time.time()
                             if current_time - start_time > max_gen_time:
                                 print("\nWarning: Total generation time exceeded limit, stopping")
+                                stop_event.set()
                                 break
+
                             segment_elapsed = current_time - segment_start_time
                             if segment_elapsed > max_segment_time:
                                 print(f"\nWarning: Segment took too long ({segment_elapsed:.1f}s), stopping")
+                                stop_event.set()
                                 break
                             segment_start_time = current_time
+
                             if audio is not None:
                                 audio_tensor = audio if isinstance(audio, torch.Tensor) else torch.from_numpy(audio).float()
                                 all_audio.append(audio_tensor)
@@ -394,10 +487,33 @@ def main() -> None:
                                 if stream:
                                     try:
                                         audio_np = audio_tensor.numpy()
-                                        play_audio_segment(audio_np, SAMPLE_RATE, play_handles)
+                                        handle, method = play_audio_segment(audio_np, SAMPLE_RATE, play_handles)
+                                        # Delay or wait to avoid cutting mid-sentence; producer keeps
+                                        # generating the next segment while we wait here.
+                                        if stream_delay is not None:
+                                            try:
+                                                if stream_delay == 0:
+                                                    if method == 'simpleaudio' and handle is not None:
+                                                        handle.wait_done()
+                                                    elif method == 'sounddevice':
+                                                        import sounddevice as sd
+                                                        sd.wait()
+                                                    else:
+                                                        time.sleep(0.5)
+                                                else:
+                                                    time.sleep(max(0.0, stream_delay))
+                                            except Exception:
+                                                time.sleep(max(0.0, stream_delay or 0.2))
                                     except Exception as e:
                                         print(f"Error while attempting to play segment: {e}")
                                 pbar.update(1)
+
+                    # Ensure producer thread is stopped
+                    stop_event.set()
+                    try:
+                        producer.join(timeout=1)
+                    except Exception:
+                        pass
                     generation_complete = True
                     watchdog.cancel()
                 except ValueError as e:
@@ -487,6 +603,7 @@ def main() -> None:
                     text = text[:dynamic_max_length]
                 speed = get_speed()
                 stream = get_stream_choice()
+                stream_delay = get_stream_delay() if stream else None
                 print(f"\nGenerating speech from file: {file_path}")
                 print(f"Using voice: {voice}")
                 print(f"Speed: {speed}x")
@@ -519,17 +636,48 @@ def main() -> None:
                         print(f"Unexpected error initializing generator: {type(e).__name__}: {e}")
                         watchdog.cancel()
                         continue
+
+                    # Prefetch producer/consumer queue to generate the next segment while
+                    # the current one is being played
+                    from queue import Queue
+                    q = Queue(maxsize=2)
+                    stop_event = threading.Event()
+                    producer = threading.Thread(target=_prefetch_generator_to_queue, args=(generator, q, stop_event), daemon=True)
+                    producer.start()
+
                     with tqdm(desc="Generating speech") as pbar:
-                        for gs, ps, audio in generator:
+                        while True:
+                            try:
+                                gs, ps, audio = q.get(timeout=1)
+                            except Exception:
+                                current_time = time.time()
+                                if current_time - start_time > max_gen_time:
+                                    print("\nWarning: Total generation time exceeded limit, stopping")
+                                    stop_event.set()
+                                    break
+                                continue
+
+                            # detect end of generation
+                            if gs is None and ps is None and audio is None:
+                                break
+                            if gs == "__ERR__":
+                                print(f"Error while generating segment: {ps}")
+                                stop_event.set()
+                                break
+
                             current_time = time.time()
                             if current_time - start_time > max_gen_time:
                                 print("\nWarning: Total generation time exceeded limit, stopping")
+                                stop_event.set()
                                 break
+
                             segment_elapsed = current_time - segment_start_time
                             if segment_elapsed > max_segment_time:
                                 print(f"\nWarning: Segment took too long ({segment_elapsed:.1f}s), stopping")
+                                stop_event.set()
                                 break
                             segment_start_time = current_time
+
                             if audio is not None:
                                 audio_tensor = audio if isinstance(audio, torch.Tensor) else torch.from_numpy(audio).float()
                                 all_audio.append(audio_tensor)
@@ -539,10 +687,30 @@ def main() -> None:
                                 if stream:
                                     try:
                                         audio_np = audio_tensor.numpy()
-                                        play_audio_segment(audio_np, SAMPLE_RATE, play_handles)
+                                        handle, method = play_audio_segment(audio_np, SAMPLE_RATE, play_handles)
+                                        if stream_delay is not None:
+                                            try:
+                                                if stream_delay == 0:
+                                                    if method == 'simpleaudio' and handle is not None:
+                                                        handle.wait_done()
+                                                    elif method == 'sounddevice':
+                                                        import sounddevice as sd
+                                                        sd.wait()
+                                                    else:
+                                                        time.sleep(0.5)
+                                                else:
+                                                    time.sleep(max(0.0, stream_delay))
+                                            except Exception:
+                                                time.sleep(max(0.0, stream_delay or 0.2))
                                     except Exception as e:
                                         print(f"Error while attempting to play segment: {e}")
                                 pbar.update(1)
+
+                    stop_event.set()
+                    try:
+                        producer.join(timeout=1)
+                    except Exception:
+                        pass
                     generation_complete = True
                     watchdog.cancel()
                 except ValueError as e:
