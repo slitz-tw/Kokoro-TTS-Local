@@ -9,14 +9,6 @@ import numpy as np
 import time
 import os
 import sys
-import requests
-import json
-import subprocess
-import threading
-import queue as _queue
-import shutil
-import signal
-import argparse
 
 # Define path type for consistent handling
 PathLike = Union[str, Path]
@@ -70,8 +62,7 @@ def print_menu():
     print("2. Generate speech from text input")
     print("3. Generate speech from EPUB/PDF file")
     print("4. Exit")
-    print("5. Interactive Ollama LLM (neural-chat) — stream responses")
-    return input("Select an option (1-5): ").strip()
+    return input("Select an option (1-4): ").strip()
 def extract_text_from_epub(epub_path: PathLike, select_chapter: bool = False) -> str:
     """Extract text from an EPUB file.
 
@@ -217,383 +208,21 @@ def get_stream_delay() -> float:
             print("Please enter a valid number (e.g., 0.2 or 0).")
 
 
-def get_yes_no(prompt: str, default: bool = False) -> bool:
-    """Prompt the user for a yes/no answer and return a bool."""
-    while True:
-        val = input(f"\n{prompt} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
-        if val == "":
-            return default
-        if val in ("y", "yes"):
-            return True
-        if val in ("n", "no"):
-            return False
-        print("Please answer 'y' or 'n'.")
 
 
-def ollama_is_available(ollama_url: str = 'http://localhost:11434') -> bool:
-    """Quick check whether Ollama appears reachable via HTTP API."""
-    try:
-        r = requests.get(ollama_url + '/api/health', timeout=1)
-        return r.status_code == 200
-    except Exception:
-        try:
-            r = requests.get(ollama_url + '/api/models', timeout=1)
-            return r.status_code == 200
-        except Exception:
-            return False
 
 
-def ollama_cli_available(ollama_cmd: str = 'ollama') -> bool:
-    """Return True if the local `ollama` CLI appears callable."""
-    if shutil.which(ollama_cmd) is None:
-        return False
-    try:
-        # quick command to list models
-        proc = subprocess.run([ollama_cmd, 'list'], capture_output=True, text=True, timeout=2)
-        return proc.returncode == 0
-    except Exception:
-        return False
 
 
-def _cli_stdout_reader(pipe, out_q, stop_event):
-    """Read stdout from subprocess and push lines or partial chunks to a queue.
-
-    Some CLI programs (including interactive runners) may not flush newline-terminated
-    lines promptly or may print prompts without a trailing newline. This reader
-    reads character-by-character and emits full lines when seen or partial
-    chunks after a short idle interval so the main thread can make progress.
-    """
-    try:
-        buffer = ''
-        last_emit = time.time()
-        idle_emit_interval = 0.25
-        while not stop_event.is_set():
-            ch = pipe.read(1)
-            if ch == '':
-                # EOF
-                if buffer:
-                    out_q.put(buffer)
-                    buffer = ''
-                break
-            buffer += ch
-            if ch == '\n':
-                out_q.put(buffer)
-                buffer = ''
-                last_emit = time.time()
-            else:
-                now = time.time()
-                if now - last_emit >= idle_emit_interval and buffer:
-                    out_q.put(buffer)
-                    buffer = ''
-                    last_emit = now
-    except Exception:
-        pass
 
 
-def _cli_stderr_reader(pipe, err_q, stop_event):
-    """Read stderr lines from subprocess and push them to a queue for diagnostics."""
-    try:
-        for ln in iter(pipe.readline, ''):
-            if stop_event.is_set():
-                break
-            err_q.put(ln)
-    except Exception:
-        pass
 
 
-def ollama_cli_chat_mode(tts_model, device, model_name: str = 'neural-chat', ollama_cmd: str = 'ollama'):
-    """Use the `ollama run <model>` CLI to interact directly (streaming via stdout).
-
-    This avoids the HTTP API and connects to the local model via the CLI process.
-    """
-    print(f"\nStarting Ollama CLI chat mode (model: {model_name}) using `{ollama_cmd}`")
-
-    if not ollama_cli_available(ollama_cmd):
-        print(f"The `{ollama_cmd}` CLI wasn't found or failed to run. Please install or configure it.")
-        return
-
-    try:
-        proc = subprocess.Popen([ollama_cmd, 'run', model_name], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-    except Exception as e:
-        print(f"Error launching `{ollama_cmd}`: {e}")
-        return
-
-    stop_event = threading.Event()
-    out_q = _queue.Queue()
-    err_q = _queue.Queue()
-
-    reader = threading.Thread(target=_cli_stdout_reader, args=(proc.stdout, out_q, stop_event), daemon=True)
-    err_reader = threading.Thread(target=_cli_stderr_reader, args=(proc.stderr, err_q, stop_event), daemon=True)
-    reader.start()
-    err_reader.start()
-
-    # Collect initial banner until prompt
-    initial = []
-    prompt_seen = False
-    while not prompt_seen:
-        try:
-            ln = out_q.get(timeout=2)
-        except Exception:
-            break
-        initial.append(ln)
-        if ln.strip().startswith('>>>') or 'Send a message' in ln:
-            prompt_seen = True
-            break
-    # print any banner lines (except the '>>> ' prompt)
-    for ln in initial:
-        if ln.strip().startswith('>>>'):
-            continue
-        print(ln, end='')
-
-    # Track recent stderr for debugging
-    from collections import deque
-    recent_err = deque(maxlen=20)
-    def _drain_stderr_now():
-        while not err_q.empty():
-            try:
-                recent_err.append(err_q.get_nowait())
-            except Exception:
-                break
 
 
-def ollama_cli_send_once(message: str, model_name: str = 'neural-chat', ollama_cmd: str = 'ollama') -> str:
-    """Run `ollama run <model> <message>` once and return stdout as a string.
-
-    Useful for non-interactive, piped invocations where stdin/TTY is not
-    available to support interactive modes.
-    """
-    try:
-        # Quote the message as a single argument; let subprocess handle spaces
-        proc = subprocess.run([ollama_cmd, 'run', model_name, message], capture_output=True, text=True, timeout=60)
-        if proc.returncode != 0:
-            err = proc.stderr.strip() or '<no stderr>'
-            raise RuntimeError(f"Ollama returned exit code {proc.returncode}: {err}")
-        return proc.stdout
-    except FileNotFoundError:
-        raise RuntimeError(f"`{ollama_cmd}` not found on PATH")
-    except Exception as e:
-        raise
-
-    print("Type your messages; empty message exits CLI mode. Use '/q' to quit the underlying process.")
-    tts_enabled = get_yes_no("Also speak responses with TTS?", default=False)
-    voice = None
-    speed = DEFAULT_SPEED
-    play_handles = []
-    voice_path = None
-    if tts_enabled:
-        voices = list_available_voices()
-        voice = select_voice(voices)
-        voice_path = Path("voices").resolve() / f"{voice}.pt"
-        if not voice_path.exists():
-            print(f"Voice not found: {voice_path}. Disabling TTS.")
-            tts_enabled = False
-        else:
-            speed = get_speed()
-
-    try:
-        while True:
-            user_prompt = input("\nYou: ").strip()
-            if not user_prompt:
-                print("Exiting Ollama CLI chat mode.")
-                break
-            if user_prompt.strip() == '/q':
-                print("Quitting underlying Ollama process.")
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                break
-
-            # send prompt to process
-            try:
-                proc.stdin.write(user_prompt + "\n")
-                proc.stdin.flush()
-            except Exception as e:
-                print(f"Error sending to process: {e}")
-                break
-
-            # Stream response until the CLI prompt reappears
-            buffer = ""
-            got_output = False
-            sent_time = time.time()
-            inactivity_timeout = 12.0  # seconds without any output before we warn
-            while True:
-                now = time.time()
-                try:
-                    ln = out_q.get(timeout=0.2)
-                    got_output = True
-                    sent_time = now
-                except Exception:
-                    # check process state and inactivity
-                    if proc.poll() is not None:
-                        print("\nOllama process exited unexpectedly.")
-                        stop_event.set()
-                        break
-                    if not got_output and (now - sent_time) > inactivity_timeout:
-                        # No output seen for a while — print helpful diagnostics
-                        print(f"\nNo response from Ollama after {int(inactivity_timeout)}s. Draining stderr for clues:")
-                        _drain_stderr_now()
-                        if recent_err:
-                            for ln in recent_err:
-                                print("[ollama stderr] ", ln, end='')
-                        else:
-                            print("(no stderr output available)")
-                        # Offer to continue waiting or abort
-                        resp = input("Continue waiting? (y/N): ").strip().lower()
-                        if resp in ('y','yes'):
-                            sent_time = time.time()
-                            continue
-                        else:
-                            print("Aborting wait for this response.")
-                            break
-                    continue
-
-                if ln.strip().startswith('>>>'):
-                    # CLI prompt -> assistant finished
-                    break
-                # Filter out helper lines
-                if ln.strip() == '' or ('Use' in ln and 'help' in ln):
-                    continue
-                # Print and optionally speak chunk
-                print(ln, end='', flush=True)
-                chunk = ln
-                buffer += chunk
-                if tts_enabled:
-                    _synthesize_and_play_text_chunk(chunk, tts_model, voice_path, speed, play_handles)
-            # end of response
-            # small pause to allow playback to finish if needed
-    except KeyboardInterrupt:
-        print("\nExiting Ollama CLI chat mode (keyboard interrupt).")
-    finally:
-        stop_event.set()
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        try:
-            reader.join(timeout=0.5)
-        except Exception:
-            pass
 
 
-def _synthesize_and_play_text_chunk(text: str, tts_model, voice_path: Path, speed: float, play_handles: list, sample_rate: int = SAMPLE_RATE):
-    """Synthesize `text` with Kokoro model and play segments as they arrive."""
-    try:
-        gen = tts_model(text, voice=str(voice_path), speed=speed, split_pattern=r'\n+')
-        for gs, ps, audio in gen:
-            if audio is None:
-                continue
-            try:
-                audio_np = audio.numpy() if isinstance(audio, torch.Tensor) else audio
-            except Exception:
-                audio_np = np.array(audio, dtype=np.float32)
-            try:
-                play_audio_segment(audio_np, sample_rate, play_handles)
-            except Exception as e:
-                print(f"Error playing TTS chunk: {e}")
-    except Exception as e:
-        print(f"Error during inline TTS playback: {e}")
 
-
-def ollama_stream_chat_mode(tts_model, device, ollama_url: str = 'http://localhost:11434', model_name: str = 'neural-chat'):
-    """Interactive chat that streams responses from an Ollama model and optionally TTSs them."""
-    print(f"\nEntering Ollama streaming chat mode (model: {model_name})")
-    if not ollama_is_available(ollama_url):
-        print(f"Could not reach Ollama at {ollama_url}.")
-        # Offer CLI fallback when HTTP API is not available
-        try:
-            if ollama_cli_available():
-                use_cli = get_yes_no("HTTP API not reachable — use local `ollama` CLI instead (no HTTP)?", default=True)
-                if use_cli:
-                    ollama_cli_chat_mode(tts_model, device, model_name=model_name)
-                    return
-        except Exception:
-            pass
-        print("Ensure the Ollama HTTP service is running, or install/configure the `ollama` CLI.")
-        return
-    print("Type your messages and press Enter. Empty message returns to menu.")
-    tts_enabled = get_yes_no("Also speak responses with TTS?", default=False)
-    voice = None
-    speed = DEFAULT_SPEED
-    play_handles = []
-    voice_path = None
-    if tts_enabled:
-        voices = list_available_voices()
-        voice = select_voice(voices)
-        voice_path = Path("voices").resolve() / f"{voice}.pt"
-        if not voice_path.exists():
-            print(f"Voice not found: {voice_path}. Disabling TTS.")
-            tts_enabled = False
-        else:
-            speed = get_speed()
-
-    session = requests.Session()
-    while True:
-        try:
-            user_prompt = input("\nYou: ").strip()
-            if not user_prompt:
-                print("Exiting Ollama chat mode.")
-                break
-            payload = {"model": model_name, "prompt": user_prompt, "stream": True}
-            try:
-                resp = session.post(ollama_url + '/api/chat', json=payload, stream=True, timeout=10)
-                if resp.status_code != 200:
-                    print(f"Error from Ollama: HTTP {resp.status_code} — {resp.text[:200]}")
-                    continue
-            except Exception as e:
-                print(f"Error connecting to Ollama: {e}")
-                continue
-
-            print("\nAssistant: ", end='', flush=True)
-            buffer = ""
-            try:
-                for line in resp.iter_lines(decode_unicode=True):
-                    if not line:
-                        continue
-                    raw = line.strip()
-                    # Some servers send "data: ..." lines
-                    if raw.startswith("data:"):
-                        raw = raw[len("data:"):].strip()
-                    try:
-                        jobj = json.loads(raw)
-                    except Exception:
-                        # not JSON: print raw text chunk
-                        chunk = raw
-                        print(chunk, end='', flush=True)
-                        buffer += chunk
-                        if tts_enabled:
-                            _synthesize_and_play_text_chunk(chunk, tts_model, voice_path, speed, play_handles)
-                        continue
-                    # extract text from common fields
-                    txt = None
-                    if isinstance(jobj, dict):
-                        txt = jobj.get('response') or jobj.get('content') or jobj.get('text') or jobj.get('output') or jobj.get('message') or jobj.get('delta')
-                        # If 'choices' style
-                        if txt is None and 'choices' in jobj and isinstance(jobj['choices'], list):
-                            try:
-                                txt = ''.join([c.get('delta', {}).get('content','') if isinstance(c, dict) else '' for c in jobj['choices']])
-                            except Exception:
-                                pass
-                    if txt:
-                        print(txt, end='', flush=True)
-                        buffer += txt
-                        if tts_enabled:
-                            # Simple strategy: speak each received txt chunk
-                            _synthesize_and_play_text_chunk(txt, tts_model, voice_path, speed, play_handles)
-                print()
-            except KeyboardInterrupt:
-                print("\n[Interrupted streaming response]")
-                continue
-            except Exception as e:
-                print(f"\nError while streaming response: {e}")
-                continue
-
-            # Optionally final TTS (speak remainder or whole buffer)
-            if tts_enabled and buffer:
-                pass  # we've already spoken chunks inline
-        except KeyboardInterrupt:
-            print("\nExiting Ollama chat mode.")
-            break
 
 
 def play_audio_segment(audio_np: np.ndarray, sample_rate: int, play_handles: list):
@@ -995,36 +624,8 @@ def save_audio_with_retry(audio_data: np.ndarray, sample_rate: int, output_path:
 def main() -> None:
     import psutil
     import gc
-    import argparse as _argparse
-
-    # Minimal CLI for non-interactive use
-    parser = _argparse.ArgumentParser(add_help=False)
-    parser.add_argument('--ollama-send', '-os', nargs='+', help='Send a single message to local ollama CLI and exit')
-    parser.add_argument('--ollama-model', '-om', default='neural-chat', help='Ollama model name (default: neural-chat)')
-    parser.add_argument('--ollama-cli', action='store_true', help='Force using ollama CLI for send')
-    parser.add_argument('--tts', action='store_true', help='If used with --ollama-send, speak the response via TTS')
-    args, _ = parser.parse_known_args()
-
+    
     try:
-        # Non-interactive: handle --ollama-send quickly and exit
-        if args.ollama_send:
-            msg = ' '.join(args.ollama_send)
-            try:
-                out = ollama_cli_send_once(msg, model_name=args.ollama_model)
-                print(out)
-                if args.tts:
-                    # Build the model so we can TTS
-                    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                    print(f"Using device: {device}")
-                    model = build_model(DEFAULT_MODEL_PATH, device)
-                    play_handles = []
-                    # simple TTS of full response
-                    _synthesize_and_play_text_chunk(out, model, Path('voices').resolve() / 'af_bella.pt', DEFAULT_SPEED, play_handles)
-                return
-            except Exception as e:
-                print(f"Error sending to Ollama CLI: {e}")
-                return
-
         # Check system memory at startup
         memory = psutil.virtual_memory()
         available_gb = memory.available / (1024**3)
@@ -1466,14 +1067,6 @@ def main() -> None:
                         print("Error: Failed to generate audio")
                     break
 
-            elif choice == "5":
-                # Interactive streaming chat with local Ollama neural-chat
-                try:
-                    ollama_stream_chat_mode(model, device)
-                except Exception as e:
-                    print(f"Error in Ollama chat mode: {type(e).__name__}: {e}")
-                    import traceback
-                    traceback.print_exc()
 
             elif choice == "4":
                 print("\nGoodbye!")
