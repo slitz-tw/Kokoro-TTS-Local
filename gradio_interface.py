@@ -38,7 +38,6 @@ from models import (
 import speed_dial
 
 # Constants
-MAX_TEXT_LENGTH = 5000
 DEFAULT_SAMPLE_RATE = 24000
 MIN_SPEED = 0.1
 MAX_SPEED = 3.0

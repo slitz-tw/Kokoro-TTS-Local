@@ -13,7 +13,6 @@ import sys
 PathLike = Union[str, Path]
 
 # Constants
-MAX_TEXT_LENGTH = 10000
 MAX_GENERATION_TIME = 300  # seconds
 MIN_GENERATION_TIME = 60   # seconds
 DEFAULT_SAMPLE_RATE = 24000
@@ -60,9 +59,29 @@ def print_menu():
     """Print the main menu options."""
     print("\n=== Kokoro TTS Menu ===")
     print("1. List available voices")
-    print("2. Generate speech")
-    print("3. Exit")
-    return input("Select an option (1-3): ").strip()
+    print("2. Generate speech from text input")
+    print("3. Generate speech from EPUB/PDF file")
+    print("4. Exit")
+    return input("Select an option (1-4): ").strip()
+def extract_text_from_epub(epub_path: PathLike) -> str:
+    from ebooklib import epub
+    from bs4 import BeautifulSoup
+    book = epub.read_epub(str(epub_path))
+    text = []
+    for item in book.get_items():
+        if item.get_type() == epub.ITEM_DOCUMENT:
+            soup = BeautifulSoup(item.get_content(), 'html.parser')
+            text.append(soup.get_text())
+    return '\n'.join(text)
+
+def extract_text_from_pdf(pdf_path: PathLike) -> str:
+    import PyPDF2
+    text = []
+    with open(pdf_path, 'rb') as f:
+        reader = PyPDF2.PdfReader(f)
+        for page in reader.pages:
+            text.append(page.extract_text() or "")
+    return '\n'.join(text)
 
 def select_voice(voices: List[str]) -> str:
     """Interactive voice selection."""
@@ -224,6 +243,7 @@ def main() -> None:
         # Cache for voices to avoid redundant calls
         voices_cache = None
 
+
         while True:
             choice = print_menu()
 
@@ -235,72 +255,48 @@ def main() -> None:
                     print(f"- {voice}")
 
             elif choice == "2":
-                # Generate speech
+                # Generate speech from text input
                 # Use cached voices if available
                 if voices_cache is None:
                     voices_cache = list_available_voices()
-
                 if not voices_cache:
                     print("No voices found! Please check the voices directory.")
                     continue
-
-                # Get user inputs
                 voice = select_voice(voices_cache)
                 text = get_text_input()
-
-                # Dynamic text length validation based on available memory
+                # ...existing code for text length validation and speech generation...
                 memory = psutil.virtual_memory()
                 available_gb = memory.available / (1024**3)
-                
-                # Adjust max length based on available memory
                 dynamic_max_length = MAX_TEXT_LENGTH
                 if available_gb < 2.0:
                     dynamic_max_length = min(MAX_TEXT_LENGTH, 3000)
                     print(f"Reduced text limit to {dynamic_max_length} characters due to low memory")
-                
                 if len(text) > dynamic_max_length:
                     print(f"Text is too long ({len(text)} chars). Maximum allowed: {dynamic_max_length} characters.")
                     print("Please enter a shorter text.")
                     continue
-
                 speed = get_speed()
-
                 print(f"\nGenerating speech for: '{text}'")
                 print(f"Using voice: {voice}")
                 print(f"Speed: {speed}x")
-
-                # Generate speech
                 all_audio = []
-                # Use Path object for consistent path handling
                 voice_path = Path("voices").resolve() / f"{voice}.pt"
-
-                # Verify voice file exists
                 if not voice_path.exists():
                     print(f"Error: Voice file not found: {voice_path}")
                     continue
-
-                # Set a timeout for generation with per-segment timeout
                 max_gen_time = MAX_GENERATION_TIME
                 max_segment_time = MIN_GENERATION_TIME
                 start_time = time.time()
                 segment_start_time = start_time
-
                 try:
-                    # Setup watchdog timer for overall process
                     import threading
                     generation_complete = False
-
                     def watchdog_timer():
                         if not generation_complete:
                             print("\nWatchdog: Generation taking too long, process will be cancelled")
-                            # Can't directly interrupt generator, but this will inform user
-
-                    # Start watchdog timer
                     watchdog = threading.Timer(max_gen_time, watchdog_timer)
-                    watchdog.daemon = True  # Don't prevent program exit
+                    watchdog.daemon = True
                     watchdog.start()
-
-                    # Initialize generator
                     try:
                         generator = model(text, voice=str(voice_path), speed=speed, split_pattern=r'\n+')
                     except (ValueError, TypeError, RuntimeError) as e:
@@ -311,45 +307,30 @@ def main() -> None:
                         print(f"Unexpected error initializing generator: {type(e).__name__}: {e}")
                         watchdog.cancel()
                         continue
-
-                    # Process segments
                     with tqdm(desc="Generating speech") as pbar:
                         for gs, ps, audio in generator:
-                            # Check overall timeout
                             current_time = time.time()
                             if current_time - start_time > max_gen_time:
                                 print("\nWarning: Total generation time exceeded limit, stopping")
                                 break
-
-                            # Check per-segment timeout
                             segment_elapsed = current_time - segment_start_time
                             if segment_elapsed > max_segment_time:
                                 print(f"\nWarning: Segment took too long ({segment_elapsed:.1f}s), stopping")
                                 break
-
-                            # Reset segment timer
                             segment_start_time = current_time
-
-                            # Process audio if available
                             if audio is not None:
-                                # Only convert if it's a numpy array, not if already tensor
                                 audio_tensor = audio if isinstance(audio, torch.Tensor) else torch.from_numpy(audio).float()
-
                                 all_audio.append(audio_tensor)
                                 print(f"\nGenerated segment: {gs}")
-                                if ps:  # Only print phonemes if available
+                                if ps:
                                     print(f"Phonemes: {ps}")
                                 pbar.update(1)
-
-                    # Mark generation as complete (for watchdog)
                     generation_complete = True
                     watchdog.cancel()
-
                 except ValueError as e:
                     print(f"Value error during speech generation: {e}")
                 except RuntimeError as e:
                     print(f"Runtime error during speech generation: {e}")
-                    # If CUDA out of memory, provide more helpful message
                     if "CUDA out of memory" in str(e):
                         print("CUDA out of memory error - try using a shorter text or switching to CPU")
                 except KeyError as e:
@@ -361,11 +342,8 @@ def main() -> None:
                     print(f"Unexpected error during speech generation: {type(e).__name__}: {e}")
                     import traceback
                     traceback.print_exc()
-
-                # Save audio
                 if all_audio:
                     try:
-                        # Handle single segment case without concatenation
                         if len(all_audio) == 1:
                             final_audio = all_audio[0]
                         else:
@@ -374,14 +352,11 @@ def main() -> None:
                             except RuntimeError as e:
                                 print(f"Error concatenating audio segments: {e}")
                                 continue
-
-                        # Use consistent Path object
                         output_path = DEFAULT_OUTPUT_FILE
                         if save_audio_with_retry(final_audio.numpy(), SAMPLE_RATE, output_path):
                             print(f"\nAudio saved to {output_path}")
-                            # Play a system beep to indicate completion
                             try:
-                                print('\a')  # ASCII bell - should make a sound on most systems
+                                print('\a')
                             except:
                                 pass
                         else:
@@ -392,9 +367,137 @@ def main() -> None:
                     print("Error: Failed to generate audio")
 
             elif choice == "3":
+                # Generate speech from EPUB/PDF file
+                if voices_cache is None:
+                    voices_cache = list_available_voices()
+                if not voices_cache:
+                    print("No voices found! Please check the voices directory.")
+                    continue
+                voice = select_voice(voices_cache)
+                print("\nEnter the path to your EPUB or PDF file:")
+                file_path = input("> ").strip()
+                if not file_path or not os.path.isfile(file_path):
+                    print("Invalid file path. Please try again.")
+                    continue
+                ext = os.path.splitext(file_path)[1].lower()
+                try:
+                    if ext == ".epub":
+                        text = extract_text_from_epub(file_path)
+                    elif ext == ".pdf":
+                        text = extract_text_from_pdf(file_path)
+                    else:
+                        print("Unsupported file type. Please provide an EPUB or PDF file.")
+                        continue
+                except Exception as e:
+                    print(f"Error extracting text: {e}")
+                    continue
+                if not text.strip():
+                    print("No text could be extracted from the file.")
+                    continue
+                print(f"Extracted {len(text)} characters from file.")
+                memory = psutil.virtual_memory()
+                available_gb = memory.available / (1024**3)
+                dynamic_max_length = MAX_TEXT_LENGTH
+                if available_gb < 2.0:
+                    dynamic_max_length = min(MAX_TEXT_LENGTH, 3000)
+                    print(f"Reduced text limit to {dynamic_max_length} characters due to low memory")
+                if len(text) > dynamic_max_length:
+                    print(f"Text is too long ({len(text)} chars). Only the first {dynamic_max_length} characters will be used.")
+                    text = text[:dynamic_max_length]
+                speed = get_speed()
+                print(f"\nGenerating speech from file: {file_path}")
+                print(f"Using voice: {voice}")
+                print(f"Speed: {speed}x")
+                all_audio = []
+                voice_path = Path("voices").resolve() / f"{voice}.pt"
+                if not voice_path.exists():
+                    print(f"Error: Voice file not found: {voice_path}")
+                    continue
+                max_gen_time = MAX_GENERATION_TIME
+                max_segment_time = MIN_GENERATION_TIME
+                start_time = time.time()
+                segment_start_time = start_time
+                try:
+                    import threading
+                    generation_complete = False
+                    def watchdog_timer():
+                        if not generation_complete:
+                            print("\nWatchdog: Generation taking too long, process will be cancelled")
+                    watchdog = threading.Timer(max_gen_time, watchdog_timer)
+                    watchdog.daemon = True
+                    watchdog.start()
+                    try:
+                        generator = model(text, voice=str(voice_path), speed=speed, split_pattern=r'\n+')
+                    except (ValueError, TypeError, RuntimeError) as e:
+                        print(f"Error initializing speech generator: {e}")
+                        watchdog.cancel()
+                        continue
+                    except Exception as e:
+                        print(f"Unexpected error initializing generator: {type(e).__name__}: {e}")
+                        watchdog.cancel()
+                        continue
+                    with tqdm(desc="Generating speech") as pbar:
+                        for gs, ps, audio in generator:
+                            current_time = time.time()
+                            if current_time - start_time > max_gen_time:
+                                print("\nWarning: Total generation time exceeded limit, stopping")
+                                break
+                            segment_elapsed = current_time - segment_start_time
+                            if segment_elapsed > max_segment_time:
+                                print(f"\nWarning: Segment took too long ({segment_elapsed:.1f}s), stopping")
+                                break
+                            segment_start_time = current_time
+                            if audio is not None:
+                                audio_tensor = audio if isinstance(audio, torch.Tensor) else torch.from_numpy(audio).float()
+                                all_audio.append(audio_tensor)
+                                print(f"\nGenerated segment: {gs}")
+                                if ps:
+                                    print(f"Phonemes: {ps}")
+                                pbar.update(1)
+                    generation_complete = True
+                    watchdog.cancel()
+                except ValueError as e:
+                    print(f"Value error during speech generation: {e}")
+                except RuntimeError as e:
+                    print(f"Runtime error during speech generation: {e}")
+                    if "CUDA out of memory" in str(e):
+                        print("CUDA out of memory error - try using a shorter text or switching to CPU")
+                except KeyError as e:
+                    print(f"Key error during speech generation: {e}")
+                    print("This might be caused by a missing voice configuration")
+                except FileNotFoundError as e:
+                    print(f"File not found: {e}")
+                except Exception as e:
+                    print(f"Unexpected error during speech generation: {type(e).__name__}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                if all_audio:
+                    try:
+                        if len(all_audio) == 1:
+                            final_audio = all_audio[0]
+                        else:
+                            try:
+                                final_audio = torch.cat(all_audio, dim=0)
+                            except RuntimeError as e:
+                                print(f"Error concatenating audio segments: {e}")
+                                continue
+                        output_path = DEFAULT_OUTPUT_FILE
+                        if save_audio_with_retry(final_audio.numpy(), SAMPLE_RATE, output_path):
+                            print(f"\nAudio saved to {output_path}")
+                            try:
+                                print('\a')
+                            except:
+                                pass
+                        else:
+                            print("Failed to save audio file")
+                    except Exception as e:
+                        print(f"Error processing audio: {type(e).__name__}: {e}")
+                else:
+                    print("Error: Failed to generate audio")
+
+            elif choice == "4":
                 print("\nGoodbye!")
                 break
-
             else:
                 print("\nInvalid choice. Please try again.")
 
