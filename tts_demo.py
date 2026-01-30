@@ -65,11 +65,15 @@ def print_menu():
     return input("Select an option (1-4): ").strip()
 def extract_text_from_epub(epub_path: PathLike) -> str:
     from ebooklib import epub
+    import ebooklib
     from bs4 import BeautifulSoup
     book = epub.read_epub(str(epub_path))
     text = []
     for item in book.get_items():
-        if item.get_type() == epub.ITEM_DOCUMENT:
+        # Prefer the numeric constant from the top-level ebooklib module, which
+        # is always available (some versions don't expose ITEM_DOCUMENT on the
+        # epub submodule).
+        if item.get_type() == ebooklib.ITEM_DOCUMENT:
             soup = BeautifulSoup(item.get_content(), 'html.parser')
             text.append(soup.get_text())
     return '\n'.join(text)
@@ -121,6 +125,66 @@ def get_speed() -> float:
             print(f"Speed must be between {MIN_SPEED} and {MAX_SPEED}")
         except ValueError:
             print("Please enter a valid number.")
+
+def get_stream_choice() -> bool:
+    """Ask the user whether to stream playback as segments are generated.
+
+    Returns:
+        True if streaming should be enabled, False otherwise.
+    """
+    while True:
+        choice = input("\nStream audio as it's generated? (y/N): ").strip().lower()
+        if choice in ("y", "yes"):
+            return True
+        if choice in ("n", "no", ""):
+            return False
+        print("Please answer 'y' or 'n'.")
+
+
+def play_audio_segment(audio_np: np.ndarray, sample_rate: int, play_handles: list) -> None:
+    """Attempt to play an audio segment using available playback libraries.
+
+    Tries in order: simpleaudio, sounddevice. If neither is available, writes
+    the segment to a temp WAV and notifies the user.
+    """
+    # Normalize to float32 in range [-1,1]
+    try:
+        audio_np = audio_np.astype(np.float32)
+    except Exception:
+        audio_np = np.array(audio_np, dtype=np.float32)
+    # Clip to safe range
+    audio_np = np.clip(audio_np, -1.0, 1.0)
+
+    # Try simpleaudio (non-blocking)
+    try:
+        import simpleaudio as sa
+        data = (audio_np * 32767).astype(np.int16).tobytes()
+        handle = sa.play_buffer(data, 1, 2, sample_rate)
+        play_handles.append(handle)
+        return
+    except Exception:
+        pass
+
+    # Try sounddevice (non-blocking play)
+    try:
+        import sounddevice as sd
+        sd.play(audio_np, sample_rate)
+        # No play handle to track; append None as placeholder
+        play_handles.append(None)
+        return
+    except Exception:
+        pass
+
+    # Fallback: write a temp WAV file so user can play it externally
+    try:
+        import tempfile
+        temp_dir = Path(tempfile.gettempdir())
+        temp_file = temp_dir / f"stream_seg_{int(time.time() * 1000)}.wav"
+        sf.write(str(temp_file), audio_np, sample_rate)
+        print(f"Saved segment to {temp_file} — open it in your media player to hear streamed audio.")
+    except Exception as e:
+        print(f"Streaming unavailable and failed to save segment: {e}")
+
 
 def save_audio_with_retry(audio_data: np.ndarray, sample_rate: int, output_path: PathLike, max_retries: int = MAX_RETRIES, retry_delay: float = RETRY_DELAY) -> bool:
     """
@@ -276,10 +340,12 @@ def main() -> None:
                     print("Please enter a shorter text.")
                     continue
                 speed = get_speed()
+                stream = get_stream_choice()
                 print(f"\nGenerating speech for: '{text}'")
                 print(f"Using voice: {voice}")
                 print(f"Speed: {speed}x")
                 all_audio = []
+                play_handles = []  # Track playback handles for non-blocking playback libraries
                 voice_path = Path("voices").resolve() / f"{voice}.pt"
                 if not voice_path.exists():
                     print(f"Error: Voice file not found: {voice_path}")
@@ -324,6 +390,13 @@ def main() -> None:
                                 print(f"\nGenerated segment: {gs}")
                                 if ps:
                                     print(f"Phonemes: {ps}")
+                                # Play the segment immediately if streaming was requested
+                                if stream:
+                                    try:
+                                        audio_np = audio_tensor.numpy()
+                                        play_audio_segment(audio_np, SAMPLE_RATE, play_handles)
+                                    except Exception as e:
+                                        print(f"Error while attempting to play segment: {e}")
                                 pbar.update(1)
                     generation_complete = True
                     watchdog.cancel()
@@ -342,6 +415,14 @@ def main() -> None:
                     print(f"Unexpected error during speech generation: {type(e).__name__}: {e}")
                     import traceback
                     traceback.print_exc()
+                # If streaming, wait for any non-blocking players to finish playback
+                if stream and play_handles:
+                    try:
+                        for h in play_handles:
+                            if h is not None and hasattr(h, 'wait_done'):
+                                h.wait_done()
+                    except Exception:
+                        pass
                 if all_audio:
                     try:
                         if len(all_audio) == 1:
@@ -405,10 +486,12 @@ def main() -> None:
                     print(f"Text is too long ({len(text)} chars). Only the first {dynamic_max_length} characters will be used.")
                     text = text[:dynamic_max_length]
                 speed = get_speed()
+                stream = get_stream_choice()
                 print(f"\nGenerating speech from file: {file_path}")
                 print(f"Using voice: {voice}")
                 print(f"Speed: {speed}x")
                 all_audio = []
+                play_handles = []
                 voice_path = Path("voices").resolve() / f"{voice}.pt"
                 if not voice_path.exists():
                     print(f"Error: Voice file not found: {voice_path}")
@@ -453,6 +536,12 @@ def main() -> None:
                                 print(f"\nGenerated segment: {gs}")
                                 if ps:
                                     print(f"Phonemes: {ps}")
+                                if stream:
+                                    try:
+                                        audio_np = audio_tensor.numpy()
+                                        play_audio_segment(audio_np, SAMPLE_RATE, play_handles)
+                                    except Exception as e:
+                                        print(f"Error while attempting to play segment: {e}")
                                 pbar.update(1)
                     generation_complete = True
                     watchdog.cancel()
@@ -471,6 +560,13 @@ def main() -> None:
                     print(f"Unexpected error during speech generation: {type(e).__name__}: {e}")
                     import traceback
                     traceback.print_exc()
+                if stream and play_handles:
+                    try:
+                        for h in play_handles:
+                            if h is not None and hasattr(h, 'wait_done'):
+                                h.wait_done()
+                    except Exception:
+                        pass
                 if all_audio:
                     try:
                         if len(all_audio) == 1:
