@@ -1,3 +1,4 @@
+MAX_TEXT_LENGTH = 1_500_000
 import torch
 from typing import Optional, Tuple, List, Union
 from models import build_model, generate_speech, list_available_voices
@@ -11,7 +12,6 @@ import sys
 
 # Define path type for consistent handling
 PathLike = Union[str, Path]
-
 # Constants
 MAX_GENERATION_TIME = 300  # seconds
 MIN_GENERATION_TIME = 60   # seconds
