@@ -255,12 +255,36 @@ def ollama_cli_available(ollama_cmd: str = 'ollama') -> bool:
 
 
 def _cli_stdout_reader(pipe, out_q, stop_event):
-    """Read stdout from subprocess and push lines to a queue."""
+    """Read stdout from subprocess and push lines or partial chunks to a queue.
+
+    Some CLI programs (including interactive runners) may not flush newline-terminated
+    lines promptly or may print prompts without a trailing newline. This reader
+    reads character-by-character and emits full lines when seen or partial
+    chunks after a short idle interval so the main thread can make progress.
+    """
     try:
-        for ln in iter(pipe.readline, ''):
-            out_q.put(ln)
-            if stop_event.is_set():
+        buffer = ''
+        last_emit = time.time()
+        idle_emit_interval = 0.25
+        while not stop_event.is_set():
+            ch = pipe.read(1)
+            if ch == '':
+                # EOF
+                if buffer:
+                    out_q.put(buffer)
+                    buffer = ''
                 break
+            buffer += ch
+            if ch == '\n':
+                out_q.put(buffer)
+                buffer = ''
+                last_emit = time.time()
+            else:
+                now = time.time()
+                if now - last_emit >= idle_emit_interval and buffer:
+                    out_q.put(buffer)
+                    buffer = ''
+                    last_emit = now
     except Exception:
         pass
 
