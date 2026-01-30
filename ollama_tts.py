@@ -23,6 +23,7 @@ from typing import Optional
 import requests
 import numpy as np
 import torch
+import re
 
 from models import build_model, list_available_voices
 
@@ -51,15 +52,35 @@ def play_audio_segment(audio_np: np.ndarray, sample_rate: int):
     print(f"Saved TTS segment to {tf}")
 
 
-def synthesize_and_play(tts_model, text: str, voice_path: Path, speed: float = 1.0):
+def synthesize_and_play(tts_model, text: str, voice_path: Path, speed: float = 1.0, split_pattern: str = r'(?<=[。！？\.\?\!])\s+'):
+    """Synthesize `text` and play. Trims leading/trailing silence and allows a custom split pattern.
+
+    The default split pattern breaks on sentence-ending punctuation so we don't synthesize tiny fragments
+    and create audible gaps between sentences.
+    """
+    def _trim_silence(audio_np: np.ndarray, thresh: float = 0.001, pad: int = 480) -> np.ndarray:
+        if audio_np.size == 0:
+            return audio_np
+        abs_audio = np.abs(audio_np)
+        idx = np.where(abs_audio > thresh)[0]
+        if idx.size == 0:
+            return np.array([], dtype=audio_np.dtype)
+        start = max(idx[0] - pad, 0)
+        end = min(idx[-1] + pad, len(audio_np) - 1)
+        return audio_np[start:end+1]
+
     try:
-        gen = tts_model(text, voice=str(voice_path), speed=speed, split_pattern=r'\n+')
+        gen = tts_model(text, voice=str(voice_path), speed=speed, split_pattern=split_pattern)
         for gs, ps, audio in gen:
             if audio is None:
                 continue
             audio_np = audio.numpy() if isinstance(audio, torch.Tensor) else np.array(audio, dtype=np.float32)
             # normalize
             audio_np = np.clip(audio_np, -1.0, 1.0).astype(np.float32)
+            # trim leading/trailing silence to reduce gaps between segments
+            audio_np = _trim_silence(audio_np, thresh=0.001, pad=int(0.02 * 24000))
+            if audio_np.size == 0:
+                continue
             try:
                 play_audio_segment(audio_np, 24000)
             except Exception as e:
@@ -92,7 +113,9 @@ def send_http_stream(url: str, model_name: str, prompt: str, tts_model=None, voi
         print(f"HTTP error: {e}")
         return
 
+    sentence_end_re = re.compile(r'[。！？\.\?\!]\s*$')
     print("Assistant: ", end='', flush=True)
+    tts_buffer = ''
     for line in r.iter_lines(decode_unicode=True):
         if not line:
             continue
@@ -116,7 +139,14 @@ def send_http_stream(url: str, model_name: str, prompt: str, tts_model=None, voi
         if text_chunk:
             print(text_chunk, end='', flush=True)
             if tts_model and voice_path:
-                synthesize_and_play(tts_model, text_chunk, voice_path, speed)
+                tts_buffer += text_chunk
+                # If buffer ends with terminal punctuation or is getting long, synthesize now
+                if sentence_end_re.search(tts_buffer) or len(tts_buffer) > 200:
+                    synthesize_and_play(tts_model, tts_buffer, voice_path, speed)
+                    tts_buffer = ''
+    # Flush remaining buffer after stream ends
+    if tts_model and voice_path and tts_buffer.strip():
+        synthesize_and_play(tts_model, tts_buffer, voice_path, speed)
     print()  # newline after completion
 
 
