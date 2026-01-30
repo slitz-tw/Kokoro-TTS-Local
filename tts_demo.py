@@ -9,6 +9,8 @@ import numpy as np
 import time
 import os
 import sys
+import requests
+import json
 
 # Define path type for consistent handling
 PathLike = Union[str, Path]
@@ -62,7 +64,8 @@ def print_menu():
     print("2. Generate speech from text input")
     print("3. Generate speech from EPUB/PDF file")
     print("4. Exit")
-    return input("Select an option (1-4): ").strip()
+    print("5. Interactive Ollama LLM (neural-chat) — stream responses")
+    return input("Select an option (1-5): ").strip()
 def extract_text_from_epub(epub_path: PathLike, select_chapter: bool = False) -> str:
     """Extract text from an EPUB file.
 
@@ -206,6 +209,142 @@ def get_stream_delay() -> float:
             return f
         except ValueError:
             print("Please enter a valid number (e.g., 0.2 or 0).")
+
+
+def get_yes_no(prompt: str, default: bool = False) -> bool:
+    """Prompt the user for a yes/no answer and return a bool."""
+    while True:
+        val = input(f"\n{prompt} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
+        if val == "":
+            return default
+        if val in ("y", "yes"):
+            return True
+        if val in ("n", "no"):
+            return False
+        print("Please answer 'y' or 'n'.")
+
+
+def ollama_is_available(ollama_url: str = 'http://localhost:11434') -> bool:
+    """Quick check whether Ollama appears reachable."""
+    try:
+        r = requests.get(ollama_url + '/api/health', timeout=1)
+        return r.status_code == 200
+    except Exception:
+        try:
+            r = requests.get(ollama_url + '/api/models', timeout=1)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+
+def _synthesize_and_play_text_chunk(text: str, tts_model, voice_path: Path, speed: float, play_handles: list, sample_rate: int = SAMPLE_RATE):
+    """Synthesize `text` with Kokoro model and play segments as they arrive."""
+    try:
+        gen = tts_model(text, voice=str(voice_path), speed=speed, split_pattern=r'\n+')
+        for gs, ps, audio in gen:
+            if audio is None:
+                continue
+            try:
+                audio_np = audio.numpy() if isinstance(audio, torch.Tensor) else audio
+            except Exception:
+                audio_np = np.array(audio, dtype=np.float32)
+            try:
+                play_audio_segment(audio_np, sample_rate, play_handles)
+            except Exception as e:
+                print(f"Error playing TTS chunk: {e}")
+    except Exception as e:
+        print(f"Error during inline TTS playback: {e}")
+
+
+def ollama_stream_chat_mode(tts_model, device, ollama_url: str = 'http://localhost:11434', model_name: str = 'neural-chat'):
+    """Interactive chat that streams responses from an Ollama model and optionally TTSs them."""
+    print(f"\nEntering Ollama streaming chat mode (model: {model_name})")
+    if not ollama_is_available(ollama_url):
+        print(f"Could not reach Ollama at {ollama_url}. Ensure the service is running.")
+        return
+    print("Type your messages and press Enter. Empty message returns to menu.")
+    tts_enabled = get_yes_no("Also speak responses with TTS?", default=False)
+    voice = None
+    speed = DEFAULT_SPEED
+    play_handles = []
+    voice_path = None
+    if tts_enabled:
+        voices = list_available_voices()
+        voice = select_voice(voices)
+        voice_path = Path("voices").resolve() / f"{voice}.pt"
+        if not voice_path.exists():
+            print(f"Voice not found: {voice_path}. Disabling TTS.")
+            tts_enabled = False
+        else:
+            speed = get_speed()
+
+    session = requests.Session()
+    while True:
+        try:
+            user_prompt = input("\nYou: ").strip()
+            if not user_prompt:
+                print("Exiting Ollama chat mode.")
+                break
+            payload = {"model": model_name, "prompt": user_prompt, "stream": True}
+            try:
+                resp = session.post(ollama_url + '/api/chat', json=payload, stream=True, timeout=10)
+                if resp.status_code != 200:
+                    print(f"Error from Ollama: HTTP {resp.status_code} — {resp.text[:200]}")
+                    continue
+            except Exception as e:
+                print(f"Error connecting to Ollama: {e}")
+                continue
+
+            print("\nAssistant: ", end='', flush=True)
+            buffer = ""
+            try:
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+                    raw = line.strip()
+                    # Some servers send "data: ..." lines
+                    if raw.startswith("data:"):
+                        raw = raw[len("data:"):].strip()
+                    try:
+                        jobj = json.loads(raw)
+                    except Exception:
+                        # not JSON: print raw text chunk
+                        chunk = raw
+                        print(chunk, end='', flush=True)
+                        buffer += chunk
+                        if tts_enabled:
+                            _synthesize_and_play_text_chunk(chunk, tts_model, voice_path, speed, play_handles)
+                        continue
+                    # extract text from common fields
+                    txt = None
+                    if isinstance(jobj, dict):
+                        txt = jobj.get('response') or jobj.get('content') or jobj.get('text') or jobj.get('output') or jobj.get('message') or jobj.get('delta')
+                        # If 'choices' style
+                        if txt is None and 'choices' in jobj and isinstance(jobj['choices'], list):
+                            try:
+                                txt = ''.join([c.get('delta', {}).get('content','') if isinstance(c, dict) else '' for c in jobj['choices']])
+                            except Exception:
+                                pass
+                    if txt:
+                        print(txt, end='', flush=True)
+                        buffer += txt
+                        if tts_enabled:
+                            # Simple strategy: speak each received txt chunk
+                            _synthesize_and_play_text_chunk(txt, tts_model, voice_path, speed, play_handles)
+                print()
+            except KeyboardInterrupt:
+                print("\n[Interrupted streaming response]")
+                continue
+            except Exception as e:
+                print(f"\nError while streaming response: {e}")
+                continue
+
+            # Optionally final TTS (speak remainder or whole buffer)
+            if tts_enabled and buffer:
+                pass  # we've already spoken chunks inline
+        except KeyboardInterrupt:
+            print("\nExiting Ollama chat mode.")
+            break
 
 
 def play_audio_segment(audio_np: np.ndarray, sample_rate: int, play_handles: list):
@@ -1049,6 +1188,15 @@ def main() -> None:
                     else:
                         print("Error: Failed to generate audio")
                     break
+
+            elif choice == "5":
+                # Interactive streaming chat with local Ollama neural-chat
+                try:
+                    ollama_stream_chat_mode(model, device)
+                except Exception as e:
+                    print(f"Error in Ollama chat mode: {type(e).__name__}: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             elif choice == "4":
                 print("\nGoodbye!")
